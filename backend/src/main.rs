@@ -59,6 +59,22 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(ErrorResponse { error: msg.into() }))
 }
 
+/// Validate that a media filename is safe (no path traversal).
+fn validate_media_filename(filename: &str) -> Result<(), ApiError> {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+        || filename.contains('\0')
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid media filename",
+        ));
+    }
+    Ok(())
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// GET /api/devices — return the current device list without triggering a new scan.
@@ -105,6 +121,8 @@ async fn play_on_device(
     Path(device_uuid): Path<String>,
     Json(body): Json<PlayRequest>,
 ) -> Result<StatusCode, ApiError> {
+    validate_media_filename(&body.media_filename)?;
+
     let (av_url, media_uri) = {
         let st = app.shared.read().await;
         let device = st
@@ -189,7 +207,10 @@ async fn get_scenes(State(app): State<WebAppState>) -> Json<Vec<Scene>> {
 async fn save_scene(
     State(app): State<WebAppState>,
     Json(body): Json<SaveSceneRequest>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
+    for filename in body.assignments.values() {
+        validate_media_filename(filename)?;
+    }
     let scene = Scene {
         name: body.name,
         assignments: body.assignments,
@@ -200,7 +221,7 @@ async fn save_scene(
     } else {
         st.scenes.push(scene);
     }
-    StatusCode::OK
+    Ok(StatusCode::OK)
 }
 
 /// DELETE /api/scenes/:name — delete a scene by name.
