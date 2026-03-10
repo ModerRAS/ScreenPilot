@@ -415,13 +415,36 @@ async fn main() {
         .layer(cors)
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
-        .await
-        .expect("Failed to bind API server on port 8080");
+    let (listener, port) = bind_with_fallback(8080).await;
 
-    log::info!("ScreenPilot API server listening on http://0.0.0.0:8080");
+    log::info!("ScreenPilot API server listening on http://0.0.0.0:{}", port);
+    log::info!("Web UI: http://localhost:{}/web", port);
 
     axum::serve(listener, app)
         .await
         .expect("API server error");
+}
+
+async fn bind_with_fallback(port: u16) -> (tokio::net::TcpListener, u16) {
+    let ports_to_try = (port..=port + 10).collect::<Vec<_>>();
+    
+    for p in &ports_to_try {
+        let addr = format!("0.0.0.0:{}", p);
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                if *p != port {
+                    eprintln!("Port {} is in use, using port {} instead", port, p);
+                }
+                return (listener, *p);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                continue;
+            }
+            Err(e) => {
+                panic!("Failed to bind on {}: {}", p, e);
+            }
+        }
+    }
+    
+    panic!("Could not bind to any port in range {:?}", ports_to_try);
 }
