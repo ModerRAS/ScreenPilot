@@ -16,6 +16,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir;
 
 use state::{PlaybackStatus, RendererDevice, Scene, SharedState};
 
@@ -337,6 +338,30 @@ fn resolve_media_dir() -> PathBuf {
     dev_candidate
 }
 
+fn resolve_frontend_dist() -> PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join("frontend").join("dist");
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+
+    let dev_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or(&PathBuf::from("."))
+        .join("frontend")
+        .join("dist");
+
+    if !dev_candidate.exists() {
+        eprintln!("Warning: frontend dist not found at {:?}", dev_candidate);
+    }
+    dev_candidate
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -344,6 +369,8 @@ async fn main() {
     env_logger::init();
 
     let media_dir = resolve_media_dir();
+
+    let frontend_dist_path = resolve_frontend_dist();
 
     let (_, media_base_url) = media_server::start_media_server(media_dir.clone(), 8090)
         .await
@@ -401,14 +428,15 @@ async fn main() {
         .route("/api/scenes/:name", delete(delete_scene))
         .route("/api/scenes/:name/apply", post(apply_scene))
         .route("/api/config/media-server-url", get(get_media_server_url))
+        .nest_service("/", ServeDir::new(frontend_dist_path))
         .layer(cors)
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3003")
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
         .await
         .expect("Failed to bind API server on port 3003");
 
-    log::info!("ScreenPilot API server listening on http://0.0.0.0:3003");
+    log::info!("ScreenPilot API server listening on http://0.0.0.0:8080");
 
     axum::serve(listener, app)
         .await
