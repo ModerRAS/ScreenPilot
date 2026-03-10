@@ -404,11 +404,11 @@ async fn main() {
         .layer(cors)
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3003")
         .await
-        .expect("Failed to bind API server on port 3000");
+        .expect("Failed to bind API server on port 3003");
 
-    log::info!("ScreenPilot API server listening on http://0.0.0.0:3000");
+    log::info!("ScreenPilot API server listening on http://0.0.0.0:3003");
 
     axum::serve(listener, app)
         .await
