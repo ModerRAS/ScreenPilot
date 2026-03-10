@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ScreenPilot",
+  "version": "0.1.0",
+  "identifier": "com.screenpilot.app",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "ScreenPilot",
+        "width": 1024,
+        "height": 768,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png",
+      "icons/icon_32x32.png",
+      "icons/icon_128x128.png",
+      "icons/icon_256x256.png"
+    ]
+  }
+}
