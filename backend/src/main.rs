@@ -411,6 +411,7 @@ async fn main() {
         .route("/api/scenes/:name/apply", post(apply_scene))
         .route("/api/config/media-server-url", get(get_media_server_url))
         .route("/web", get(serve_frontend))
+        .route("/web/", get(serve_frontend))
         .route("/web/*path", get(serve_frontend))
         .layer(cors)
         .with_state(app_state);
