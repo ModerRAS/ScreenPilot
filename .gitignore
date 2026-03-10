@@ -23,6 +23,7 @@ target
 # Node dependencies
 node_modules/
 
-# Tauri build output
-src-tauri/target/
+# Frontend build output
+frontend/dist/
+
 .sisyphus
