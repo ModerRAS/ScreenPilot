@@ -46,17 +46,14 @@ ScreenPilot/
 ## 开发运行
 
 ```bash
-# 安装前端依赖
-cd frontend && pnpm install
+# 终端 1: 先构建前端
+cd frontend && pnpm build
 
-# 终端 1: 启动后端（API 端口 3003，媒体服务器端口 8090）
+# 终端 2: 启动后端（同时提供 API 和前端，端口 8080）
 cd backend && cargo run
-
-# 终端 2: 启动前端（Vite 开发服务器端口 5173）
-cd frontend && pnpm dev
 ```
 
-然后在浏览器中打开 http://localhost:5173
+然后在浏览器中打开 http://localhost:8080
 
 ## 构建
 

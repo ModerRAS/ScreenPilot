@@ -48,17 +48,14 @@ ScreenPilot/
 ## Development
 
 ```bash
-# Install frontend dependencies
-cd frontend && pnpm install
+# Terminal 1: Build frontend first
+cd frontend && pnpm build
 
-# Terminal 1: Start backend (API on port 3003, Media server on port 8090)
+# Terminal 2: Start backend (serves both API and frontend on port 8080)
 cd backend && cargo run
-
-# Terminal 2: Start frontend (Vite dev server on port 5173)
-cd frontend && pnpm dev
 ```
 
-Then open http://localhost:5173 in your browser.
+Then open http://localhost:8080 in your browser.
 
 ## Build
 
