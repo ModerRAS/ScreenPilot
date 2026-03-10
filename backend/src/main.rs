@@ -1,0 +1,395 @@
+mod discovery;
+mod dlna;
+mod media_server;
+mod state;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tower_http::cors::{Any, CorsLayer};
+
+use state::{PlaybackStatus, RendererDevice, Scene, SharedState};
+
+// ─── Shared application state for Axum ────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct WebAppState {
+    pub shared: SharedState,
+    pub client: Arc<Mutex<Client>>,
+    pub media_dir: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SceneApplyResult {
+    pub device_uuid: String,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+// ─── Request / Response types ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PlayRequest {
+    media_filename: String,
+}
+
+#[derive(Deserialize)]
+struct SaveSceneRequest {
+    name: String,
+    assignments: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+type ApiError = (StatusCode, Json<ErrorResponse>);
+
+fn error_response(status: StatusCode, msg: impl Into<String>) -> ApiError {
+    (status, Json(ErrorResponse { error: msg.into() }))
+}
+
+// ─── Handlers ─────────────────────────────────────────────────────────────────
+
+/// GET /api/devices — return the current device list without triggering a new scan.
+async fn get_devices(State(app): State<WebAppState>) -> Json<Vec<RendererDevice>> {
+    let st = app.shared.read().await;
+    Json(st.devices.clone())
+}
+
+/// POST /api/devices/discover — trigger SSDP discovery and return updated list.
+async fn discover_devices(State(app): State<WebAppState>) -> Json<Vec<RendererDevice>> {
+    let devices = discovery::discover_renderers().await;
+    let mut st = app.shared.write().await;
+
+    let existing: HashMap<String, (PlaybackStatus, Option<String>)> = st
+        .devices
+        .iter()
+        .map(|d| (d.uuid.clone(), (d.status.clone(), d.current_media.clone())))
+        .collect();
+
+    let mut merged: Vec<RendererDevice> = devices
+        .into_iter()
+        .map(|mut d| {
+            if let Some((status, media)) = existing.get(&d.uuid) {
+                d.status = status.clone();
+                d.current_media = media.clone();
+            }
+            d
+        })
+        .collect();
+
+    for old in &st.devices {
+        if !merged.iter().any(|d| d.uuid == old.uuid) {
+            merged.push(old.clone());
+        }
+    }
+
+    st.devices = merged.clone();
+    Json(merged)
+}
+
+/// POST /api/devices/:uuid/play — play a media file on a specific device.
+async fn play_on_device(
+    State(app): State<WebAppState>,
+    Path(device_uuid): Path<String>,
+    Json(body): Json<PlayRequest>,
+) -> Result<StatusCode, ApiError> {
+    let (av_url, media_uri) = {
+        let st = app.shared.read().await;
+        let device = st
+            .devices
+            .iter()
+            .find(|d| d.uuid == device_uuid)
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Device not found: {}", device_uuid),
+                )
+            })?;
+        let uri = format!("{}/media/{}", st.media_server_base_url, body.media_filename);
+        (device.av_transport_url.clone(), uri)
+    };
+
+    let client = app.client.lock().await;
+    dlna::play_media(&client, &av_url, &media_uri)
+        .await
+        .map_err(|e| error_response(StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let mut st = app.shared.write().await;
+    if let Some(device) = st.devices.iter_mut().find(|d| d.uuid == device_uuid) {
+        device.status = PlaybackStatus::Playing;
+        device.current_media = Some(body.media_filename);
+    }
+    Ok(StatusCode::OK)
+}
+
+/// POST /api/devices/:uuid/pause — pause playback on a specific device.
+async fn pause_device(
+    State(app): State<WebAppState>,
+    Path(device_uuid): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let av_url = resolve_av_url(&app, &device_uuid).await.map_err(|e| {
+        error_response(StatusCode::NOT_FOUND, e)
+    })?;
+    let client = app.client.lock().await;
+    dlna::pause(&client, &av_url)
+        .await
+        .map_err(|e| error_response(StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let mut st = app.shared.write().await;
+    if let Some(d) = st.devices.iter_mut().find(|d| d.uuid == device_uuid) {
+        d.status = PlaybackStatus::Paused;
+    }
+    Ok(StatusCode::OK)
+}
+
+/// POST /api/devices/:uuid/stop — stop playback on a specific device.
+async fn stop_device(
+    State(app): State<WebAppState>,
+    Path(device_uuid): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let av_url = resolve_av_url(&app, &device_uuid).await.map_err(|e| {
+        error_response(StatusCode::NOT_FOUND, e)
+    })?;
+    let client = app.client.lock().await;
+    dlna::stop(&client, &av_url)
+        .await
+        .map_err(|e| error_response(StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let mut st = app.shared.write().await;
+    if let Some(d) = st.devices.iter_mut().find(|d| d.uuid == device_uuid) {
+        d.status = PlaybackStatus::Stopped;
+    }
+    Ok(StatusCode::OK)
+}
+
+/// GET /api/media — list available media files.
+async fn list_media(State(app): State<WebAppState>) -> Json<Vec<String>> {
+    Json(media_server::list_media_files(&app.media_dir))
+}
+
+/// GET /api/scenes — return the list of defined scenes.
+async fn get_scenes(State(app): State<WebAppState>) -> Json<Vec<Scene>> {
+    let st = app.shared.read().await;
+    Json(st.scenes.clone())
+}
+
+/// POST /api/scenes — save (create or update) a scene.
+async fn save_scene(
+    State(app): State<WebAppState>,
+    Json(body): Json<SaveSceneRequest>,
+) -> StatusCode {
+    let scene = Scene {
+        name: body.name,
+        assignments: body.assignments,
+    };
+    let mut st = app.shared.write().await;
+    if let Some(existing) = st.scenes.iter_mut().find(|s| s.name == scene.name) {
+        *existing = scene;
+    } else {
+        st.scenes.push(scene);
+    }
+    StatusCode::OK
+}
+
+/// DELETE /api/scenes/:name — delete a scene by name.
+async fn delete_scene(
+    State(app): State<WebAppState>,
+    Path(scene_name): Path<String>,
+) -> StatusCode {
+    let mut st = app.shared.write().await;
+    st.scenes.retain(|s| s.name != scene_name);
+    StatusCode::OK
+}
+
+/// POST /api/scenes/:name/apply — apply a scene to all assigned devices.
+async fn apply_scene(
+    State(app): State<WebAppState>,
+    Path(scene_name): Path<String>,
+) -> Result<Json<Vec<SceneApplyResult>>, ApiError> {
+    let (assignments, media_base) = {
+        let st = app.shared.read().await;
+        let scene = st
+            .scenes
+            .iter()
+            .find(|s| s.name == scene_name)
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Scene not found: {}", scene_name),
+                )
+            })?;
+        (scene.assignments.clone(), st.media_server_base_url.clone())
+    };
+
+    let mut results = Vec::new();
+    for (uuid, filename) in &assignments {
+        let av_url = match resolve_av_url(&app, uuid).await {
+            Ok(u) => u,
+            Err(e) => {
+                results.push(SceneApplyResult {
+                    device_uuid: uuid.clone(),
+                    success: false,
+                    error: Some(e),
+                });
+                continue;
+            }
+        };
+        let media_uri = format!("{}/media/{}", media_base, filename);
+        let client = app.client.lock().await;
+        match dlna::play_media(&client, &av_url, &media_uri).await {
+            Ok(_) => {
+                drop(client);
+                let mut st = app.shared.write().await;
+                if let Some(d) = st.devices.iter_mut().find(|d| d.uuid == *uuid) {
+                    d.status = PlaybackStatus::Playing;
+                    d.current_media = Some(filename.clone());
+                }
+                results.push(SceneApplyResult {
+                    device_uuid: uuid.clone(),
+                    success: true,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                results.push(SceneApplyResult {
+                    device_uuid: uuid.clone(),
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+    Ok(Json(results))
+}
+
+/// GET /api/config/media-server-url — return the media server base URL.
+async fn get_media_server_url(State(app): State<WebAppState>) -> Json<String> {
+    let st = app.shared.read().await;
+    Json(st.media_server_base_url.clone())
+}
+
+// ─── Helper ───────────────────────────────────────────────────────────────────
+
+async fn resolve_av_url(app: &WebAppState, uuid: &str) -> Result<String, String> {
+    let st = app.shared.read().await;
+    st.devices
+        .iter()
+        .find(|d| d.uuid == uuid)
+        .map(|d| d.av_transport_url.clone())
+        .ok_or_else(|| format!("Device not found: {}", uuid))
+}
+
+/// Resolve the media directory: next to the binary or the project `media/` folder.
+fn resolve_media_dir() -> PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join("media");
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+
+    // During development, use a `media` folder in the workspace root.
+    let dev_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or(&PathBuf::from("."))
+        .join("media");
+
+    if !dev_candidate.exists() {
+        let _ = std::fs::create_dir_all(&dev_candidate);
+    }
+    dev_candidate
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    env_logger::init();
+
+    let media_dir = resolve_media_dir();
+
+    let (_, media_base_url) = media_server::start_media_server(media_dir.clone(), 8090)
+        .await
+        .expect("Failed to start media server");
+
+    let shared = state::new_shared_state();
+    {
+        let mut s = shared.write().await;
+        s.media_server_base_url = media_base_url;
+    }
+
+    // Background discovery loop
+    let shared_for_bg = shared.clone();
+    tokio::spawn(async move {
+        loop {
+            let devices = discovery::discover_renderers().await;
+            let mut st = shared_for_bg.write().await;
+            for d in &mut st.devices {
+                if let Some(fresh) = devices.iter().find(|f| f.uuid == d.uuid) {
+                    d.name = fresh.name.clone();
+                    d.ip = fresh.ip.clone();
+                    d.av_transport_url = fresh.av_transport_url.clone();
+                }
+            }
+            for fresh in &devices {
+                if !st.devices.iter().any(|d| d.uuid == fresh.uuid) {
+                    st.devices.push(fresh.clone());
+                }
+            }
+            drop(st);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+
+    let app_state = WebAppState {
+        shared,
+        client: Arc::new(Mutex::new(Client::new())),
+        media_dir,
+    };
+
+    // CORS — allow the Vue dev server and any other origin
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .route("/api/devices", get(get_devices))
+        .route("/api/devices/discover", post(discover_devices))
+        .route("/api/devices/{uuid}/play", post(play_on_device))
+        .route("/api/devices/{uuid}/pause", post(pause_device))
+        .route("/api/devices/{uuid}/stop", post(stop_device))
+        .route("/api/media", get(list_media))
+        .route("/api/scenes", get(get_scenes).post(save_scene))
+        .route("/api/scenes/{name}", delete(delete_scene))
+        .route("/api/scenes/{name}/apply", post(apply_scene))
+        .route("/api/config/media-server-url", get(get_media_server_url))
+        .layer(cors)
+        .with_state(app_state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .expect("Failed to bind API server on port 3000");
+
+    log::info!("ScreenPilot API server listening on http://0.0.0.0:3000");
+
+    axum::serve(listener, app)
+        .await
+        .expect("API server error");
+}
