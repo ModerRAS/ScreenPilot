@@ -55,7 +55,7 @@ cd frontend && pnpm build
 cd backend && cargo run
 ```
 
-Then open http://localhost:8080 in your browser.
+Then open http://localhost:8080/web in your browser.
 
 ## Build
 

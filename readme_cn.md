@@ -53,7 +53,7 @@ cd frontend && pnpm build
 cd backend && cargo run
 ```
 
-然后在浏览器中打开 http://localhost:8080
+然后在浏览器中打开 http://localhost:8080/web
 
 ## 构建
 

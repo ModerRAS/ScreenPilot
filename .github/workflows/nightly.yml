@@ -54,7 +54,7 @@ jobs:
         working-directory: frontend
         run: pnpm build
 
-      - name: Build backend
+      - name: Build backend (frontend embedded)
         working-directory: backend
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -62,7 +62,6 @@ jobs:
         if: matrix.platform != 'windows-latest'
         run: |
           mkdir -p release
-          cp -r frontend/dist release/
           cp backend/target/${{ matrix.target }}/release/screen-pilot-backend release/
           cp -r media release/
           tar -czvf screen-pilot-${{ matrix.target }}-nightly.tar.gz release/
@@ -71,7 +70,6 @@ jobs:
         if: matrix.platform == 'windows-latest'
         run: |
           mkdir -p release
-          cp -r frontend/dist release/
           cp backend/target/${{ matrix.target }}/release/screen-pilot-backend.exe release/
           cp -r media release/
           powershell -Command "Compress-Archive -Path release/* -DestinationPath screen-pilot-${{ matrix.target }}-nightly.zip"
@@ -82,10 +80,11 @@ jobs:
           tag_name: nightly-${{ github.run_number }}
           name: 'Nightly ${{ github.run_number }}'
           body: |
-            Nightly build of ScreenPilot (Axum + Vue)
+            Nightly build of ScreenPilot (Axum + Vue, single binary)
             - Commit: ${{ github.sha }}
             - Date: ${{ github.event.repository.updated_at }}
             - Platform: ${{ matrix.target }}
+            - Access UI at /web
           draft: false
           prerelease: true
           files: |
