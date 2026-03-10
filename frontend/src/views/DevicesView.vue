@@ -1,0 +1,112 @@
+<script setup lang="ts">
+import { ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { useAppStore } from '@/stores/app'
+import * as api from '@/api'
+
+const store = useAppStore()
+const selectedMedia = ref<Record<string, string>>({})
+
+function statusType(status: string): '' | 'success' | 'warning' | 'info' | 'danger' {
+  switch (status) {
+    case 'playing': return 'success'
+    case 'paused': return 'warning'
+    case 'stopped': return 'info'
+    case 'error': return 'danger'
+    default: return 'info'
+  }
+}
+
+async function play(uuid: string) {
+  const filename = selectedMedia.value[uuid]
+  if (!filename) {
+    ElMessage.warning('Please select a media file first.')
+    return
+  }
+  try {
+    await api.playOnDevice(uuid, filename)
+    ElMessage.success(`▶ Playing "${filename}"`)
+    await store.loadDevices()
+  } catch (e: any) {
+    ElMessage.error(`Play failed: ${e.message}`)
+  }
+}
+
+async function pause(uuid: string) {
+  try {
+    await api.pauseDevice(uuid)
+    ElMessage.success('⏸ Paused')
+    await store.loadDevices()
+  } catch (e: any) {
+    ElMessage.error(`Pause failed: ${e.message}`)
+  }
+}
+
+async function stop(uuid: string) {
+  try {
+    await api.stopDevice(uuid)
+    ElMessage.success('⏹ Stopped')
+    await store.loadDevices()
+  } catch (e: any) {
+    ElMessage.error(`Stop failed: ${e.message}`)
+  }
+}
+</script>
+
+<template>
+  <div>
+    <el-empty v-if="store.devices.length === 0" description="No devices found. Click Discover Devices to scan the network." />
+
+    <el-row :gutter="16">
+      <el-col v-for="device in store.devices" :key="device.uuid" :xs="24" :sm="12" :md="8" :lg="6">
+        <el-card shadow="hover" style="margin-bottom: 16px">
+          <template #header>
+            <div style="display: flex; justify-content: space-between; align-items: center">
+              <div>
+                <strong>{{ device.name }}</strong>
+                <div style="font-size: 12px; color: var(--el-text-color-secondary)">{{ device.ip }}</div>
+              </div>
+              <el-tag :type="statusType(device.status)" size="small">
+                {{ device.status.toUpperCase() }}
+              </el-tag>
+            </div>
+          </template>
+
+          <div v-if="device.current_media" style="margin-bottom: 12px; font-size: 13px; color: var(--el-text-color-secondary)">
+            Now playing: <strong>{{ device.current_media }}</strong>
+          </div>
+
+          <div style="display: flex; gap: 8px; margin-bottom: 12px">
+            <el-select
+              v-model="selectedMedia[device.uuid]"
+              placeholder="Select media"
+              style="flex: 1"
+              size="small"
+            >
+              <el-option
+                v-for="file in store.mediaFiles"
+                :key="file"
+                :label="file"
+                :value="file"
+              />
+            </el-select>
+            <el-button type="primary" size="small" @click="play(device.uuid)">▶ Play</el-button>
+          </div>
+
+          <div style="display: flex; gap: 8px">
+            <el-button
+              size="small"
+              :disabled="device.status !== 'playing'"
+              @click="pause(device.uuid)"
+            >⏸ Pause</el-button>
+            <el-button
+              size="small"
+              :disabled="device.status === 'idle' || device.status === 'stopped'"
+              @click="stop(device.uuid)"
+            >⏹ Stop</el-button>
+          </div>
+        </el-card>
+      </el-col>
+    </el-row>
+  </div>
+</template>
