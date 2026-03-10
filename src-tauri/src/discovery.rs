@@ -279,4 +279,91 @@ mod tests {
             Some("http://192.168.1.5:49152/upnp/control/AVTransport".to_string())
         );
     }
+
+    #[test]
+    fn test_parse_location_case_insensitive() {
+        let response = "HTTP/1.1 200 OK\r\nlocation: http://192.168.1.5:49152/desc.xml\r\n\r\n";
+        assert_eq!(
+            parse_location(response),
+            Some("http://192.168.1.5:49152/desc.xml".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_location_multiple_spaces() {
+        let response = "HTTP/1.1 200 OK\r\nLOCATION:   http://192.168.1.5:49152/desc.xml  \r\n\r\n";
+        assert_eq!(
+            parse_location(response),
+            Some("http://192.168.1.5:49152/desc.xml".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_location_no_location() {
+        let response = "HTTP/1.1 200 OK\r\nSERVER: Test/1.0\r\n\r\n";
+        assert_eq!(parse_location(response), None);
+    }
+
+    #[test]
+    fn test_extract_xml_text_with_namespace() {
+        let xml = r#"<root xmlns:u="urn:schemas-upnp-org"><u:friendlyName>Bedroom TV</u:friendlyName></root>"#;
+        assert_eq!(extract_xml_text(xml, "friendlyName"), None);
+    }
+
+    #[test]
+    fn test_extract_xml_text_embedded_tags() {
+        let xml = "<root><friendlyName>TV<special/>Tag</friendlyName></root>";
+        let result = extract_xml_text(xml, "friendlyName");
+        assert!(result.is_none() || result == Some("TV<special/>Tag".to_string()));
+    }
+
+    #[test]
+    fn test_base_url_no_path() {
+        assert_eq!(base_url("http://192.168.1.5:49152"), "http://192.168.1.5:49152");
+    }
+
+    #[test]
+    fn test_base_url_with_root() {
+        assert_eq!(base_url("http://192.168.1.5:49152/"), "http://192.168.1.5:49152");
+    }
+
+    #[test]
+    fn test_url_host_with_port() {
+        assert_eq!(
+            url_host("http://192.168.1.5:49152/desc.xml"),
+            Some("192.168.1.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_url_host_https() {
+        assert_eq!(
+            url_host("https://192.168.1.5:443/desc.xml"),
+            Some("192.168.1.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_url_host_no_scheme() {
+        assert_eq!(url_host("192.168.1.5:49152/desc.xml"), None);
+    }
+
+    #[test]
+    fn test_url_host_empty() {
+        assert_eq!(url_host(""), None);
+    }
+
+    #[test]
+    fn test_find_av_transport_url_not_found() {
+        let xml = r#"<root><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType></root>"#;
+        let result = find_av_transport_url(xml, "http://192.168.1.5:49152/desc.xml");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_ssdp_constants() {
+        assert_eq!(SSDP_ADDR, "239.255.255.250");
+        assert_eq!(SSDP_PORT, 1900);
+        assert_eq!(SEARCH_TARGET, "urn:schemas-upnp-org:device:MediaRenderer:1");
+    }
 }

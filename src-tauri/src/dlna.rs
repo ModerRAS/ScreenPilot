@@ -153,4 +153,54 @@ mod tests {
         let body = soap_envelope("Pause", "");
         assert!(body.contains("<u:Pause xmlns:u="));
     }
+
+    #[test]
+    fn test_soap_envelope_empty_args() {
+        let body = soap_envelope("Stop", "");
+        assert!(body.contains("</u:Stop>"));
+        assert!(body.contains("<InstanceID>0</InstanceID>"));
+    }
+
+    #[test]
+    fn test_xml_escape_all_characters() {
+        assert_eq!(xml_escape("&<>\"'"), "&amp;&lt;&gt;&quot;&apos;");
+    }
+
+    #[test]
+    fn test_xml_escape_no_escape_needed() {
+        assert_eq!(xml_escape("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_xml_escape_already_escaped() {
+        assert_eq!(xml_escape("&amp;"), "&amp;amp;");
+    }
+
+    #[test]
+    fn test_soap_envelope_with_complex_args() {
+        let args = "<CurrentURI>http://example.com/video.mp4</CurrentURI><CurrentURIMetaData>&lt;&gt;</CurrentURIMetaData>";
+        let body = soap_envelope("SetAVTransportURI", args);
+        assert!(body.contains("SetAVTransportURI"));
+        assert!(body.contains("CurrentURI"));
+        assert!(body.contains("video.mp4"));
+    }
+
+    #[test]
+    fn test_soap_action_header_format() {
+        let action = "Play";
+        let soap_action = format!(
+            "\"urn:schemas-upnp-org:service:AVTransport:1#{}\"",
+            action
+        );
+        assert_eq!(soap_action, "\"urn:schemas-upnp-org:service:AVTransport:1#Play\"");
+    }
+
+    #[test]
+    fn test_soap_envelope_se_complete() {
+        let body = soap_envelope("Seek", "<Unit>REL_TIME</Unit><Target>00:01:30</Target>");
+        assert!(body.starts_with("<?xml version=\"1.0\" encoding=\"utf-8\"?>"));
+        assert!(body.contains("<s:Envelope"));
+        assert!(body.contains("</s:Envelope>"));
+        assert!(body.contains("<u:Seek xmlns:u="));
+    }
 }

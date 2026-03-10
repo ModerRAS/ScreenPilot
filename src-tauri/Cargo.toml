@@ -31,3 +31,6 @@ log = "0.4"
 once_cell = "1"
 anyhow = "1"
 tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+tempfile = "3"
