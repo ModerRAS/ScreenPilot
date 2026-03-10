@@ -2,13 +2,13 @@
 
 [中文说明](./readme_cn.md)
 
-A small LAN digital signage controller written in **Rust + Tauri** that uses **DLNA / UPnP AV** to control multiple screens.
+A LAN digital signage controller built with **Rust + Axum** (backend) and **Vue 3 + ElementUI** (frontend), using **DLNA / UPnP AV** to control multiple screens.
 
 ## Features
 
-- **SSDP Discovery** — automatically finds DLNA MediaRenderer devices on your LAN (auto-refresh every 30 s)
+- **SSDP Discovery** — automatically finds DLNA MediaRenderer devices on your LAN (manual trigger)
 - **DLNA Control** — sends UPnP AVTransport SOAP commands (SetAVTransportURI, Play, Pause, Stop) to each renderer
-- **Media HTTP Server** — built-in Axum HTTP server that serves media files from a local `media/` directory
+- **Media HTTP Server** — built-in Axum HTTP server that serves media files from a local `media/` directory (port 8090)
 - **Per-Screen Control** — each device is independently controllable from the UI
 - **Scenes** — group device→media assignments and apply them with one click
 
@@ -17,60 +17,103 @@ A small LAN digital signage controller written in **Rust + Tauri** that uses **D
 ```
 ScreenPilot/
 ├── Cargo.toml                  # Workspace root
-├── package.json                # Tauri CLI / frontend deps
-├── src/                        # Frontend (HTML + vanilla JS)
-│   ├── index.html
-│   ├── main.js
-│   └── styles.css
-├── src-tauri/                  # Rust / Tauri backend
+├── package.json                # Root package (for pnpm workspace)
+├── backend/                   # Rust + Axum API server
 │   ├── Cargo.toml
-│   ├── tauri.conf.json
 │   └── src/
-│       ├── lib.rs              # Shared types + helpers exported to main
-│       ├── main.rs             # Tauri commands + app entry point
-│       ├── discovery.rs        # SSDP discovery
-│       ├── dlna.rs             # UPnP AVTransport SOAP commands
-│       ├── media_server.rs     # Axum HTTP media file server
-│       └── state.rs            # RendererDevice, Scene, AppState
-└── media/                      # Drop your .mp4 / .webm files here
-    └── README.txt
+│       ├── main.rs             # Axum routes + app entry
+│       ├── discovery.rs       # SSDP discovery
+│       ├── dlna.rs            # UPnP AVTransport SOAP commands
+│       ├── media_server.rs    # Axum media file server
+│       └── state.rs           # RendererDevice, Scene, AppState
+├── frontend/                  # Vue 3 + ElementUI + Vite + pnpm
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── src/
+│       ├── main.ts            # Vue entry point
+│       ├── App.vue            # Root component
+│       ├── api/               # API client (axios)
+│       ├── views/             # DevicesView, ScenesView
+│       ├── stores/            # Pinia state
+│       └── types/             # TypeScript types
+└── media/                    # Drop your .mp4 / .webm files here
 ```
 
 ## Prerequisites
 
-### Linux
-```bash
-sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
-```
-
-### macOS / Windows
-Follow the [Tauri prerequisites guide](https://tauri.app/start/prerequisites/).
+- **Rust** — Install via [rustup](https://rustup.rs/)
+- **Node.js** — v20+
+- **pnpm** — Install via `npm install -g pnpm`
 
 ## Development
 
 ```bash
-# Install Node deps (Tauri CLI)
-npm install
+# Install frontend dependencies
+cd frontend && pnpm install
 
-# Run in dev mode (hot-reloads the UI)
-npm run dev
+# Terminal 1: Start backend (API on port 3003, Media server on port 8090)
+cd backend && cargo run
 
-# Or build a release binary
-npm run build
+# Terminal 2: Start frontend (Vite dev server on port 5173)
+cd frontend && pnpm dev
+```
+
+Then open http://localhost:5173 in your browser.
+
+## Build
+
+```bash
+# Build frontend
+cd frontend && pnpm build
+
+# Build backend
+cd backend && cargo build --release
+
+# Or use pnpm workspace to build both
+pnpm --filter frontend build
+pnpm --filter backend build
+```
+
+## Production
+
+```bash
+# Run backend
+./backend/target/release/screen-pilot-backend
+
+# Serve frontend dist (e.g., with nginx, or use Vite preview)
+cd frontend && pnpm preview
 ```
 
 ## Usage
 
-1. Drop media files (`.mp4`, `.webm`, etc.) into the `media/` directory next to the binary.
-2. Launch ScreenPilot.
-3. Click **Discover Devices** to scan the LAN.
-4. Select a media file and click **▶ Play** for any discovered renderer.
-5. Use **Scenes** to define and apply multi-screen layouts at once.
+1. Drop media files (`.mp4`, `.webm`, etc.) into the `media/` directory.
+2. Start the backend: `cargo run --manifest-path backend/Cargo.toml`
+3. Start the frontend: `pnpm --dir frontend dev`
+4. Open http://localhost:5173
+5. Click **Discover Devices** to scan the LAN.
+6. Select a media file and click **▶ Play** for any discovered renderer.
+7. Use **Scenes** to define and apply multi-screen layouts at once.
 
-## Rust Modules
+## API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/devices` | List all discovered devices |
+| POST | `/api/devices/discover` | Trigger SSDP discovery |
+| POST | `/api/devices/:uuid/play` | Play media on device |
+| POST | `/api/devices/:uuid/pause` | Pause playback |
+| POST | `/api/devices/:uuid/stop` | Stop playback |
+| GET | `/api/media` | List media files |
+| GET | `/api/scenes` | List saved scenes |
+| POST | `/api/scenes` | Save a scene |
+| DELETE | `/api/scenes/:name` | Delete a scene |
+| POST | `/api/scenes/:name/apply` | Apply scene to devices |
+| GET | `/api/config/media-server-url` | Get media server URL |
+
+## Rust Modules (Backend)
 
 | Module | Responsibility |
-|---|---|
+|--------|----------------|
 | `discovery` | SSDP M-SEARCH, device description XML parsing |
 | `dlna` | SOAP envelope building, AVTransport HTTP calls |
 | `media_server` | Axum static file server, `local_ip()` helper |
