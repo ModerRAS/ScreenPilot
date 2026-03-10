@@ -1,5 +1,7 @@
 # ScreenPilot
 
+[中文说明](./readme_cn.md)
+
 A small LAN digital signage controller written in **Rust + Tauri** that uses **DLNA / UPnP AV** to control multiple screens.
 
 ## Features
