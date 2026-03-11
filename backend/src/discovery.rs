@@ -1,12 +1,15 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
+use std::io::Read;
 
 use anyhow::{Context, Result};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use regex::Regex;
 use reqwest::Client;
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::time::sleep;
 
+use crate::media_server;
 use crate::state::RendererDevice;
 
 const SSDP_ADDR: &str = "239.255.255.250";
@@ -16,7 +19,7 @@ const SEARCH_TARGETS: &[&str] = &[
     "urn:schemas-upnp-org:device:MediaRenderer:1",
     "urn:schemas-upnp-org:device:MediaRenderer:2",
 ];
-const MX: u8 = 3; // 3 seconds per target (total ~10s for 3 targets)
+const MX: u8 = 5; // 5 seconds per target (total ~16s for 3 targets)
 
 /// Send M-SEARCH multicast for each search target and collect unique location URLs.
 fn ssdp_search(_timeout: Duration) -> Result<Vec<String>> {
@@ -39,21 +42,32 @@ fn ssdp_search(_timeout: Duration) -> Result<Vec<String>> {
 }
 
 fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> {
+    info!("Starting SSDP search for target: {}", target);
+    
     let raw_socket =
         Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).context("create UDP socket")?;
     raw_socket.set_reuse_address(true).context("set_reuse_address")?;
+    
+    raw_socket.set_multicast_ttl_v4(4).context("set_multicast_ttl_v4")?;
 
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     raw_socket.bind(&bind_addr.into()).context("bind UDP socket")?;
 
     raw_socket
         .set_multicast_loop_v4(true)
         .context("set_multicast_loop_v4")?;
 
+    let multicast_iface = media_server::local_ip()
+        .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+        .unwrap_or_else(|| Ipv4Addr::new(0, 0, 0, 0));
+
+    eprintln!("[DEBUG] Using local IP {} for multicast interface", multicast_iface);
+    info!("Using local IP {} for multicast interface", multicast_iface);
+
     raw_socket
         .join_multicast_v4(
             &"239.255.255.250".parse::<Ipv4Addr>().unwrap(),
-            &"0.0.0.0".parse::<Ipv4Addr>().unwrap(),
+            &multicast_iface,
         )
         .context("join_multicast_v4")?;
 
@@ -76,31 +90,48 @@ fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> 
         IpAddr::V4(SSDP_ADDR.parse::<Ipv4Addr>().unwrap()),
         SSDP_PORT,
     );
+    
+    debug!("Sending M-SEARCH request:\n{}", request);
+    
     socket
         .send_to(request.as_bytes(), dest)
         .context("send M-SEARCH")?;
 
+    info!("M-SEARCH sent to {}:{}, waiting for responses...", SSDP_ADDR, SSDP_PORT);
+    eprintln!("[DEBUG] M-SEARCH sent for target: {}", target);
+
     let mut locations: Vec<String> = Vec::new();
     let mut buf = [0u8; 4096];
+    let mut response_count = 0;
 
     loop {
         match socket.recv_from(&mut buf) {
-            Ok((len, _src)) => {
+            Ok((len, src)) => {
+                response_count += 1;
+                eprintln!("[DEBUG] Received {} bytes from {}", len, src);
+                info!("Received SSDP response #{} from {}", response_count, src);
                 let response = String::from_utf8_lossy(&buf[..len]);
+                eprintln!("[DEBUG] Raw response: {:?}", &response[..response.len().min(200)]);
                 debug!("SSDP response:\n{}", response);
                 if let Some(location) = parse_location(&response) {
+                    eprintln!("[DEBUG] Found location: {}", location);
                     if !locations.contains(&location) {
                         locations.push(location);
                     }
                 }
             }
-            Err(e) if is_timeout_error(&e) => break,
+            Err(e) if is_timeout_error(&e) => {
+                eprintln!("[DEBUG] Timeout after {} responses", response_count);
+                break;
+            }
             Err(e) => {
                 warn!("SSDP recv error: {e}");
                 break;
             }
         }
     }
+
+    info!("SSDP discovery complete. Received {} responses, found {} locations", response_count, locations.len());
 
     Ok(locations)
 }
@@ -127,9 +158,31 @@ async fn fetch_device_description(
     client: &Client,
     location: &str,
 ) -> Result<RendererDevice> {
+    let max_retries = 3;
+
+    for attempt in 0..max_retries {
+        match fetch_device_description_once(client, location).await {
+            Ok(device) => return Ok(device),
+            Err(e) if attempt < max_retries - 1 => {
+                let delay_ms = 200u64 * 2u64.pow(attempt as u32);
+                let delay = Duration::from_millis(delay_ms);
+                tokio::time::sleep(delay).await;
+                log::debug!("Retry fetch device description for {}: {}", location, e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    unreachable!()
+}
+
+async fn fetch_device_description_once(
+    client: &Client,
+    location: &str,
+) -> Result<RendererDevice> {
     let body = client
         .get(location)
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .send()
         .await
         .context("GET device description")?

@@ -465,7 +465,9 @@ fn resolve_media_dir() -> PathBuf {
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
 
     let media_dir = resolve_media_dir();
 
