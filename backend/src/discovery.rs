@@ -210,6 +210,7 @@ async fn fetch_device_description_once(
         av_transport_url,
         status: crate::state::PlaybackStatus::Idle,
         current_media: None,
+        loop_playback: false,
     })
 }
 

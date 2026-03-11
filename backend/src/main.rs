@@ -438,6 +438,120 @@ fn check_cache(media_dir: &PathBuf, filename: &str, encoder: &HardwareEncoder) -
     None
 }
 
+async fn spawn_ffmpeg_stream_with_cache(
+    media_dir: &PathBuf,
+    filename: &str,
+    encoder: &HardwareEncoder,
+    loop_playback: bool,
+) -> Result<(tokio::sync::mpsc::UnboundedReceiver<Result<Vec<u8>, std::io::Error>>, std::thread::JoinHandle<()>), String> {
+    use std::process::{Command, Stdio};
+    use std::io::Read;
+    
+    let media_path = media_dir.join(filename);
+    if !media_path.exists() {
+        return Err("Media file not found".to_string());
+    }
+    
+    let media_path_str = media_path.to_str().unwrap().to_string();
+    let cache_path = get_cache_path(media_dir, filename, encoder);
+    let cache_dir = get_cache_dir(media_dir);
+    let cache_path_str = cache_path.to_str().unwrap().to_string();
+    
+    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Failed to create cache dir: {}", e))?;
+    
+    let (video_args, audio_args) = build_encoder_args(encoder);
+    
+    log::info!("Starting stream with encoder: {:?}, loop: {}, cache: {:?}", encoder, loop_playback, cache_path.display());
+    
+    let mut cmd = Command::new("ffmpeg");
+    
+    if loop_playback {
+        cmd.arg("-stream_loop").arg("-1");
+    }
+    
+    cmd.arg("-re")
+       .arg("-i").arg(&media_path_str);
+    
+    for arg in video_args {
+        cmd.arg(arg);
+    }
+    for arg in audio_args {
+        cmd.arg(arg);
+    }
+    
+    // Use tee to output to both pipe (for streaming) and file (for caching)
+    cmd.arg("-f")
+       .arg("mpegts")
+       .arg(&format!("tee:pipe:1|[f=mpegts]{}", cache_path_str));
+    
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+
+    let mut stdout = child.stdout.take().ok_or_else(|| 
+        "Failed to capture ffmpeg output".to_string())?;
+
+    let mut ffmpeg = FfmpegProcess { child };
+    
+    let encoder_for_check = encoder.clone();
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut error_output = String::new();
+        if let Some(stderr) = ffmpeg.child.stderr.take() {
+            let mut stderr = stderr;
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let msg = String::from_utf8_lossy(&buf[..n]);
+                        error_output.push_str(&msg);
+                        if msg.to_lowercase().contains("error") 
+                            || msg.to_lowercase().contains("failed")
+                            || msg.to_lowercase().contains("cannot")
+                            || msg.to_lowercase().contains("invalid") {
+                            log::error!("ffmpeg: {}", msg);
+                        } else {
+                            log::warn!("ffmpeg: {}", msg);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if !matches!(encoder_for_check, HardwareEncoder::None) {
+            let lower = error_output.to_lowercase();
+            if lower.contains("cannot load") 
+                || lower.contains("failed to open")
+                || lower.contains("not found")
+                || lower.contains("no device") {
+                log::warn!("Hardware encoder {:?} failed to initialize: {}", encoder_for_check, error_output);
+            }
+        }
+    });
+    
+    let (tx, rx) = tokio_mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
+    
+    let _stdout_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    
+    Ok((rx, stderr_thread))
+}
+
 async fn transcode_to_cache(
     media_dir: &PathBuf,
     filename: &str,
@@ -675,13 +789,13 @@ async fn stream_media(
         return Err(error_response(StatusCode::NOT_FOUND, "Media file not found"));
     }
     
-    let encoder_pref = {
+    let (encoder_pref, loop_playback) = {
         let st = app.shared.read().await;
-        st.preferred_encoder.clone()
+        (st.preferred_encoder.clone(), st.loop_playback)
     };
     
     let hw_encoder = get_encoder_from_preference(&encoder_pref);
-    log::info!("Using encoder preference: {} -> {:?}", encoder_pref, hw_encoder);
+    log::info!("Using encoder preference: {} -> {:?}, loop: {}", encoder_pref, hw_encoder, loop_playback);
     
     // Check cache first
     if let Some(cache_path) = check_cache(&app.media_dir, &filename, &hw_encoder) {
@@ -689,54 +803,41 @@ async fn stream_media(
         return Ok(serve_cached_file(&cache_path).into_response());
     }
     
-    // No cache - transcode while streaming
-    if !matches!(hw_encoder, HardwareEncoder::None) {
-        match timeout(Duration::from_secs(5), spawn_ffmpeg_stream(&app.media_dir, &filename, &hw_encoder)).await {
-            Ok(Ok((mut rx, _stderr_thread))) => {
-                match timeout(Duration::from_secs(3), async { rx.recv().await }).await {
-                    Ok(Some(Ok(_chunk))) => {
-                        log::debug!("Hardware encoder {:?} started successfully", hw_encoder);
-                    }
-                    Ok(Some(Err(e))) => {
-                        log::warn!("Hardware encoder {:?} produced error: {}. Falling back to software.", hw_encoder, e);
-                    }
-                    Ok(None) => {
-                        log::warn!("Hardware encoder {:?} stream ended unexpectedly. Falling back to software.", hw_encoder);
-                    }
-                    Err(_) => {
-                        log::warn!("Hardware encoder {:?} may have failed to initialize (no output within 3s). Falling back to software.", hw_encoder);
-                    }
+    match timeout(Duration::from_secs(5), spawn_ffmpeg_stream_with_cache(&app.media_dir, &filename, &hw_encoder, loop_playback)).await {
+        Ok(Ok((mut rx, _stderr_thread))) => {
+            match timeout(Duration::from_secs(3), async { rx.recv().await }).await {
+                Ok(Some(Ok(_chunk))) => {
+                    log::debug!("Stream started successfully with encoder {:?}", hw_encoder);
                 }
+                Ok(Some(Err(e))) => {
+                    log::warn!("Stream produced error: {}.", e);
+                }
+                Ok(None) => {
+                    log::warn!("Stream ended unexpectedly.");
+                }
+                Err(_) => {
+                    log::warn!("Stream may have failed to initialize (no output within 3s).");
+                }
+            }
+            
+            if matches!(timeout(Duration::from_secs(1), async { rx.recv().await }).await, Ok(Some(Ok(_)))) {
+                let stream = async_stream::stream! {
+                    while let Some(chunk) = rx.recv().await {
+                        yield chunk;
+                    }
+                };
                 
-                if matches!(timeout(Duration::from_secs(1), async { rx.recv().await }).await, Ok(Some(Ok(_)))) {
-                    // Start background cache transcoding (while streaming)
-                    let media_dir_for_cache = app.media_dir.clone();
-                    let filename_for_cache = filename.clone();
-                    let encoder_for_cache = hw_encoder.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = transcode_to_cache(&media_dir_for_cache, &filename_for_cache, &encoder_for_cache).await {
-                            log::error!("Failed to create cache: {}", e);
-                        }
-                    });
-                    
-                    let stream = async_stream::stream! {
-                        while let Some(chunk) = rx.recv().await {
-                            yield chunk;
-                        }
-                    };
-                    
-                    return Ok((
-                        [("Content-Type", "video/mp2t")],
-                        axum::body::Body::from_stream(stream)
-                    ).into_response());
-                }
+                return Ok((
+                    [("Content-Type", "video/mp2t")],
+                    axum::body::Body::from_stream(stream)
+                ).into_response());
             }
-            Ok(Err(e)) => {
-                log::warn!("Hardware encoder {:?} failed to start: {}. Falling back to software.", hw_encoder, e);
-            }
-            Err(_) => {
-                log::warn!("Hardware encoder {:?} timed out during initialization. Falling back to software.", hw_encoder);
-            }
+        }
+        Ok(Err(e)) => {
+            log::warn!("Failed to start stream: {}.", e);
+        }
+        Err(_) => {
+            log::warn!("Stream timed out during initialization.");
         }
     }
     
@@ -744,18 +845,9 @@ async fn stream_media(
     let software_encoder = HardwareEncoder::None;
     log::info!("Using software encoder (libx264)");
     
-    let (mut rx, _stderr_thread) = spawn_ffmpeg_stream(&app.media_dir, &filename, &software_encoder)
+    let (mut rx, _stderr_thread) = spawn_ffmpeg_stream_with_cache(&app.media_dir, &filename, &software_encoder, loop_playback)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    
-    // Start background cache transcoding while streaming (with loop for infinite playback)
-    let media_dir_for_cache = app.media_dir.clone();
-    let filename_for_cache = filename.clone();
-    tokio::spawn(async move {
-        if let Err(e) = transcode_to_cache(&media_dir_for_cache, &filename_for_cache, &software_encoder).await {
-            log::error!("Failed to create cache: {}", e);
-        }
-    });
     
     let stream = async_stream::stream! {
         while let Some(chunk) = rx.recv().await {
@@ -958,6 +1050,26 @@ struct SetEncoderRequest {
     encoder: String,
 }
 
+#[derive(Deserialize)]
+struct SetLoopRequest {
+    loop_playback: bool,
+}
+
+async fn get_loop_playback(State(app): State<WebAppState>) -> Json<bool> {
+    let st = app.shared.read().await;
+    Json(st.loop_playback)
+}
+
+async fn set_loop_playback(
+    State(app): State<WebAppState>,
+    Json(body): Json<SetLoopRequest>,
+) -> Result<StatusCode, ApiError> {
+    let mut st = app.shared.write().await;
+    st.loop_playback = body.loop_playback;
+    log::info!("Loop playback set to: {}", st.loop_playback);
+    Ok(StatusCode::OK)
+}
+
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
 async fn resolve_av_url(app: &WebAppState, uuid: &str) -> Result<String, String> {
@@ -1016,6 +1128,7 @@ async fn main() {
         log::info!("Loaded {} devices from persistence", s.devices.len());
         s.media_server_base_url = media_base_url;
         s.preferred_encoder = "auto".to_string();
+        s.loop_playback = true;
     }
 
     // Background discovery loop
@@ -1074,6 +1187,7 @@ async fn main() {
         .route("/api/scenes/:name/apply", post(apply_scene))
         .route("/api/config/media-server-url", get(get_media_server_url))
         .route("/api/config/encoder", get(get_encoder).put(set_encoder))
+        .route("/api/config/loop-playback", get(get_loop_playback).put(set_loop_playback))
         .nest_service("/media", ServeDir::new(media_dir.clone()))
         .route("/web/assets/*path", get(serve_assets))
         .route("/web/favicon.ico", get(serve_favicon))

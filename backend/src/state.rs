@@ -12,6 +12,7 @@ pub struct RendererDevice {
     pub av_transport_url: String,
     pub status: PlaybackStatus,
     pub current_media: Option<String>,
+    pub loop_playback: bool,
 }
 
 /// Current playback status of a renderer.
@@ -52,8 +53,10 @@ pub struct AppState {
     pub scenes: Vec<Scene>,
     /// Base URL for the media server, e.g. "http://192.168.1.10:8090"
     pub media_server_base_url: String,
-    /// Preferred encoder: "auto", "nvidia", "amd", "intel", "apple", "software"
+    /// Preferred encoder: "auto", "nvidia", "amd", "intel", "apple", "vaapi", "software"
     pub preferred_encoder: String,
+    /// Loop playback for transcoded stream
+    pub loop_playback: bool,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;

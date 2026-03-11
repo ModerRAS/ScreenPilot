@@ -112,6 +112,7 @@ mod tests {
                 av_transport_url: "http://192.168.1.100:49152/upnp/control/AVTransport".to_string(),
                 status: crate::state::PlaybackStatus::Idle,
                 current_media: None,
+                loop_playback: false,
             },
             RendererDevice {
                 uuid: "test-uuid-2".to_string(),
@@ -120,6 +121,7 @@ mod tests {
                 av_transport_url: "http://192.168.1.101:49152/upnp/control/AVTransport".to_string(),
                 status: crate::state::PlaybackStatus::Playing,
                 current_media: Some("test.mp4".to_string()),
+                loop_playback: false,
             },
         ];
 
