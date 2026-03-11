@@ -5,6 +5,7 @@ export interface RendererDevice {
   av_transport_url: string
   status: 'idle' | 'playing' | 'paused' | 'stopped' | 'error'
   current_media: string | null
+  loop_playback: boolean
 }
 
 export interface Scene {

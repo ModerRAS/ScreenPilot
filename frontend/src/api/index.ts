@@ -70,3 +70,12 @@ export async function getEncoder(): Promise<string> {
 export async function setEncoder(encoder: string): Promise<void> {
   await api.put('/config/encoder', { encoder })
 }
+
+export async function getDeviceLoop(uuid: string): Promise<boolean> {
+  const { data } = await api.get<boolean>(`/devices/${encodeURIComponent(uuid)}/loop`)
+  return data
+}
+
+export async function setDeviceLoop(uuid: string, loop: boolean): Promise<void> {
+  await api.put(`/devices/${encodeURIComponent(uuid)}/loop`, { loop })
+}

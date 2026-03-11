@@ -88,6 +88,17 @@ async function handleEncoderChange(value: string) {
     ElMessage.error('Failed to set encoder')
   }
 }
+
+async function toggleLoop(uuid: string, loop: boolean) {
+  try {
+    await api.setDeviceLoop(uuid, loop)
+    ElMessage.success(loop ? 'Loop enabled' : 'Loop disabled')
+    await store.loadDevices()
+  } catch (e: any) {
+    ElMessage.error('Failed to set loop')
+    await store.loadDevices()
+  }
+}
 </script>
 
 <template>
@@ -167,6 +178,12 @@ async function handleEncoderChange(value: string) {
               :disabled="device.status === 'idle' || device.status === 'stopped'"
               @click="stop(device.uuid)"
             >⏹ Stop</el-button>
+            <el-switch
+              v-model="device.loop_playback"
+              size="small"
+              active-text="Loop"
+              @change="(val: boolean) => toggleLoop(device.uuid, val)"
+            />
           </div>
         </el-card>
       </el-col>
