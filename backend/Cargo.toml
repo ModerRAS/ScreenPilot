@@ -25,6 +25,9 @@ anyhow = "1"
 tokio-util = { version = "0.7", features = ["io"] }
 rust-embed = "8"
 regex = "1"
+bytes = "1"
+futures-util = "0.3"
+async-stream = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

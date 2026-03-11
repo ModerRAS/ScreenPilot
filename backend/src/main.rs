@@ -199,7 +199,7 @@ async fn play_on_device(
                     format!("Device not found: {}", device_uuid),
                 )
             })?;
-        let uri = format!("{}/media/{}", st.media_server_base_url, body.media_filename);
+        let uri = format!("{}/api/media/stream/{}", st.media_server_base_url, body.media_filename);
         (device.av_transport_url.clone(), uri)
     };
 
@@ -261,7 +261,72 @@ async fn list_media(State(app): State<WebAppState>) -> Json<Vec<String>> {
     Json(media_server::list_media_files(&app.media_dir))
 }
 
-/// POST /api/media/upload — upload a media file.
+async fn stream_media(
+    State(app): State<WebAppState>,
+    Path(filename): Path<String>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    use std::process::{Command, Stdio};
+    use std::io::Read;
+    
+    validate_media_filename(&filename)?;
+    
+    let media_path = app.media_dir.join(&filename);
+    if !media_path.exists() {
+        return Err(error_response(StatusCode::NOT_FOUND, "Media file not found"));
+    }
+    
+    let media_path_str = media_path.to_str().unwrap().to_string();
+    
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-stream_loop", "-1",
+            "-re",
+            "-i", &media_path_str,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-c:a", "aac",
+            "-f", "mpegts",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start ffmpeg: {}", e)))?;
+    
+    let mut stdout = child.stdout.take().ok_or_else(|| 
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to capture ffmpeg output"))?;
+    
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
+    
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    
+    let stream = async_stream::stream! {
+        for chunk in rx {
+            yield chunk;
+        }
+    };
+    
+    Ok((
+        [("Content-Type", "video/mp2t")],
+        axum::body::Body::from_stream(stream)
+    ))
+}
+
+/// POST /api/media/upload
 async fn upload_media(
     State(app): State<WebAppState>,
     mut multipart: Multipart,
@@ -391,7 +456,7 @@ async fn apply_scene(
                 continue;
             }
         };
-        let media_uri = format!("{}/media/{}", media_base, filename);
+        let media_uri = format!("{}/api/media/stream/{}", media_base, filename);
         let client = app.client.lock().await;
         match dlna::play_media(&client, &av_url, &media_uri).await {
             Ok(_) => {
@@ -472,7 +537,7 @@ async fn main() {
     let media_dir = resolve_media_dir();
 
     let local_ip = media_server::local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
-    let media_base_url = format!("http://{}:8080/media", local_ip);
+    let media_base_url = format!("http://{}:8080", local_ip);
 
     let shared = state::new_shared_state();
 
@@ -534,6 +599,7 @@ async fn main() {
         .route("/api/devices/:uuid/stop", post(stop_device))
         .route("/api/media", get(list_media))
         .route("/api/media/upload", post(upload_media).layer(DefaultBodyLimit::max(100 * 1024 * 1024 * 1024)))
+        .route("/api/media/stream/*path", get(stream_media))
         .route("/api/scenes", get(get_scenes).post(save_scene))
         .route("/api/scenes/:name", delete(delete_scene))
         .route("/api/scenes/:name/apply", post(apply_scene))
