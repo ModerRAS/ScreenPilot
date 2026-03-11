@@ -3,6 +3,7 @@ mod dlna;
 mod frontend;
 mod media_server;
 mod state;
+mod persistence;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -169,6 +170,12 @@ async fn discover_devices(State(app): State<WebAppState>) -> Json<Vec<RendererDe
     }
 
     st.devices = merged.clone();
+
+    // Persist devices to file
+    if let Err(e) = persistence::save_devices(&merged) {
+        log::warn!("Failed to save devices: {}", e);
+    }
+
     Json(merged)
 }
 
@@ -466,8 +473,12 @@ async fn main() {
     let media_base_url = format!("http://{}:8080/media", local_ip);
 
     let shared = state::new_shared_state();
+
+    // Load saved devices
     {
         let mut s = shared.write().await;
+        s.devices = persistence::load_devices();
+        log::info!("Loaded {} devices from persistence", s.devices.len());
         s.media_server_base_url = media_base_url;
     }
 
@@ -489,7 +500,14 @@ async fn main() {
                     st.devices.push(fresh.clone());
                 }
             }
+            let devices_to_save = st.devices.clone();
             drop(st);
+
+            // Save devices after background discovery
+            if let Err(e) = persistence::save_devices(&devices_to_save) {
+                log::warn!("Failed to save devices in background: {}", e);
+            }
+
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
