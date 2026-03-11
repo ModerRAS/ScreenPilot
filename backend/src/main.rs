@@ -269,7 +269,7 @@ enum HardwareEncoder {
     IntelQsv,
     AmdVce,
     AppleVtb,
-    VAAPI,
+    Vaapi,
 }
 
 fn detect_hardware_encoder() -> HardwareEncoder {
@@ -305,7 +305,7 @@ fn detect_hardware_encoder() -> HardwareEncoder {
             #[cfg(target_os = "linux")]
             if encoders.contains("h264_vaapi") {
                 log::info!("Using VAAPI hardware encoding");
-                return HardwareEncoder::VAAPI;
+                return HardwareEncoder::Vaapi;
             }
         }
         Err(e) => {
@@ -323,6 +323,7 @@ fn get_encoder_from_preference(pref: &str) -> HardwareEncoder {
         "amd" => HardwareEncoder::AmdVce,
         "intel" => HardwareEncoder::IntelQsv,
         "apple" => HardwareEncoder::AppleVtb,
+        "vaapi" => HardwareEncoder::Vaapi,
         "software" => HardwareEncoder::None,
         _ => detect_hardware_encoder(),
     }
@@ -365,7 +366,7 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
             ],
             vec!["-c:a", "aac", "-b:a", "256k"],
         ),
-        HardwareEncoder::VAAPI => (
+        HardwareEncoder::Vaapi => (
             vec![
                 "-vaapi_device", "/dev/dri/renderD128",
                 "-vf", "format=nv12,hwupload",
@@ -769,7 +770,7 @@ async fn set_encoder(
     State(app): State<WebAppState>,
     Json(body): Json<SetEncoderRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let valid = ["auto", "nvidia", "amd", "intel", "apple", "software"];
+    let valid = ["auto", "nvidia", "amd", "intel", "apple", "vaapi", "software"];
     if !valid.contains(&body.encoder.as_str()) {
         return Err(error_response(StatusCode::BAD_REQUEST, "Invalid encoder"));
     }
