@@ -28,6 +28,53 @@ async fn serve_frontend() -> impl axum::response::IntoResponse {
     axum::response::Html(html)
 }
 
+async fn serve_assets(Path(path): Path<String>) -> impl axum::response::IntoResponse {
+    let full_path = format!("assets/{}", path);
+    match Frontend::get(&full_path) {
+        Some(file) => {
+            let mime = match path.rsplit('.').next() {
+                Some("js") => "application/javascript",
+                Some("css") => "text/css",
+                Some("html") => "text/html",
+                Some("ico") => "image/x-icon",
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("svg") => "image/svg+xml",
+                Some("woff") => "font/woff",
+                Some("woff2") => "font/woff2",
+                _ => "application/octet-stream",
+            };
+            let body = axum::body::Body::from(file.data.as_ref().to_vec());
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", mime)
+                .body(body)
+                .unwrap()
+        }
+        None => axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("Not found".into())
+            .unwrap(),
+    }
+}
+
+async fn serve_favicon() -> impl axum::response::IntoResponse {
+    match Frontend::get("favicon.ico") {
+        Some(file) => {
+            let body = axum::body::Body::from(file.data.as_ref().to_vec());
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "image/x-icon")
+                .body(body)
+                .unwrap()
+        }
+        None => axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("Not found".into())
+            .unwrap(),
+    }
+}
+
 // ─── Shared application state for Axum ────────────────────────────────────────
 
 #[derive(Clone)]
@@ -410,9 +457,11 @@ async fn main() {
         .route("/api/scenes/:name", delete(delete_scene))
         .route("/api/scenes/:name/apply", post(apply_scene))
         .route("/api/config/media-server-url", get(get_media_server_url))
+        .route("/web/assets/*path", get(serve_assets))
+        .route("/web/favicon.ico", get(serve_favicon))
         .route("/web", get(serve_frontend))
         .route("/web/", get(serve_frontend))
-        .route("/web/*path", get(serve_frontend))
+        .fallback(get(serve_frontend))
         .layer(cors)
         .with_state(app_state);
 
