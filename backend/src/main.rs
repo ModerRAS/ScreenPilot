@@ -261,6 +261,118 @@ async fn list_media(State(app): State<WebAppState>) -> Json<Vec<String>> {
     Json(media_server::list_media_files(&app.media_dir))
 }
 
+#[derive(Debug, Clone)]
+enum HardwareEncoder {
+    None,
+    Nvidia,
+    IntelQsv,
+    AmdVce,
+    AppleVtb,
+    VAAPI,
+}
+
+fn detect_hardware_encoder() -> HardwareEncoder {
+    let output = std::process::Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-encoders")
+        .output();
+    
+    match output {
+        Ok(o) => {
+            let encoders = String::from_utf8_lossy(&o.stdout);
+            if encoders.contains("h264_nvenc") {
+                log::info!("Using NVIDIA GPU hardware encoding");
+                return HardwareEncoder::Nvidia;
+            }
+            if encoders.contains("h264_qsv") {
+                log::info!("Using Intel Quick Sync Video hardware encoding");
+                return HardwareEncoder::IntelQsv;
+            }
+            if encoders.contains("h264_amf") {
+                log::info!("Using AMD GPU hardware encoding");
+                return HardwareEncoder::AmdVce;
+            }
+            if encoders.contains("h264_videotoolbox") {
+                log::info!("Using Apple VideoToolbox hardware encoding");
+                return HardwareEncoder::AppleVtb;
+            }
+            if encoders.contains("h264_vaapi") {
+                log::info!("Using VAAPI hardware encoding");
+                return HardwareEncoder::VAAPI;
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to detect hardware encoders: {}", e);
+        }
+    }
+    
+    log::info!("No hardware encoder found, using software encoding");
+    HardwareEncoder::None
+}
+
+fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static str>) {
+    match hw {
+        HardwareEncoder::Nvidia => (
+            vec![
+                "-c:v", "h264_nvenc",
+                "-preset", "p4",
+                "-tune", "ll",
+                "-rc", "cqp",
+                "-qp", "18",
+                "-bf", "3",
+                "-b:v", "0",
+            ],
+            vec!["-c:a", "aac", "-b:a", "192k"],
+        ),
+        HardwareEncoder::IntelQsv => (
+            vec![
+                "-c:v", "h264_qsv",
+                "-preset", "veryfast",
+                "-look_ahead", "0",
+                "-q", "18",
+                "-bitrate", "0",
+            ],
+            vec!["-c:a", "aac", "-b:a", "192k"],
+        ),
+        HardwareEncoder::AmdVce => (
+            vec![
+                "-c:v", "h264_amf",
+                "-preset", "quality",
+                "-qp", "18",
+            ],
+            vec!["-c:a", "aac", "-b:a", "192k"],
+        ),
+        HardwareEncoder::AppleVtb => (
+            vec![
+                "-c:v", "h264_videotoolbox",
+                "-profile:v", "high",
+                "-quantizer", "18",
+                "-realtime",
+            ],
+            vec!["-c:a", "aac", "-b:a", "192k"],
+        ),
+        HardwareEncoder::VAAPI => (
+            vec![
+                "-vaapi_device", "/dev/dri/renderD128",
+                "-vf", "format=nv12,hwupload",
+                "-c:v", "h264_vaapi",
+                "-qp", "18",
+            ],
+            vec!["-c:a", "aac", "-b:a", "192k"],
+        ),
+        HardwareEncoder::None => (
+            vec![
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-crf", "18",
+                "-vf", "scale=-2:720",
+            ],
+            vec!["-c:a", "aac", "-b:a", "192k"],
+        ),
+    }
+}
+
 async fn stream_media(
     State(app): State<WebAppState>,
     Path(filename): Path<String>,
@@ -277,21 +389,27 @@ async fn stream_media(
     
     let media_path_str = media_path.to_str().unwrap().to_string();
     
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-stream_loop", "-1",
-            "-re",
-            "-i", &media_path_str,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-c:a", "aac",
-            "-f", "mpegts",
-            "-",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+    let hw_encoder = detect_hardware_encoder();
+    let (video_args, audio_args) = build_encoder_args(&hw_encoder);
+    
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-stream_loop").arg("-1");
+    cmd.arg("-re");
+    cmd.arg("-i").arg(&media_path_str);
+    
+    for arg in video_args {
+        cmd.arg(arg);
+    }
+    for arg in audio_args {
+        cmd.arg(arg);
+    }
+    
+    cmd.arg("-f").arg("mpegts");
+    cmd.arg("-");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::null());
+    
+    let mut child = cmd.spawn()
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start ffmpeg: {}", e)))?;
     
     let mut stdout = child.stdout.take().ok_or_else(|| 
