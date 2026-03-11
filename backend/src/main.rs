@@ -17,6 +17,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir;
 
 use state::{PlaybackStatus, RendererDevice, Scene, SharedState};
 use frontend::Frontend;
@@ -401,9 +402,8 @@ async fn main() {
 
     let media_dir = resolve_media_dir();
 
-    let (_, media_base_url) = media_server::start_media_server(media_dir.clone(), 8090)
-        .await
-        .expect("Failed to start media server");
+    let local_ip = media_server::local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+    let media_base_url = format!("http://{}:8080/media", local_ip);
 
     let shared = state::new_shared_state();
     {
@@ -437,7 +437,7 @@ async fn main() {
     let app_state = WebAppState {
         shared,
         client: Arc::new(Mutex::new(Client::new())),
-        media_dir,
+        media_dir: media_dir.clone(),
     };
 
     // CORS — allow the Vue dev server and any other origin
@@ -457,6 +457,7 @@ async fn main() {
         .route("/api/scenes/:name", delete(delete_scene))
         .route("/api/scenes/:name/apply", post(apply_scene))
         .route("/api/config/media-server-url", get(get_media_server_url))
+        .nest_service("/media", ServeDir::new(media_dir.clone()))
         .route("/web/assets/*path", get(serve_assets))
         .route("/web/favicon.ico", get(serve_favicon))
         .route("/web", get(serve_frontend))
