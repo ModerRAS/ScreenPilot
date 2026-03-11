@@ -2,34 +2,72 @@ name: Nightly Release
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天 UTC 0:00 运行
-  workflow_dispatch:  # 允许手动触发
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-linux:
     permissions:
       contents: write
-    runs-on: ${{ matrix.platform }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: 'macos-latest'
-            target: 'aarch64-apple-darwin'
-            binary_name: 'screen-pilot-backend'
-          - platform: 'macos-latest'
-            target: 'x86_64-apple-darwin'
-            binary_name: 'screen-pilot-backend'
-          - platform: 'ubuntu-22.04'
-            target: 'x86_64-unknown-linux-gnu'
-            binary_name: 'screen-pilot-backend'
-          - platform: 'windows-latest'
-            target: 'x86_64-pc-windows-msvc'
-            binary_name: 'screen-pilot-backend.exe'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: ./frontend
+
+      - name: Build frontend
+        run: pnpm build
+        working-directory: ./frontend
+
+      - name: Build backend
+        run: cargo build --release
+        working-directory: ./backend
+
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          cp ./backend/target/release/screen-pilot-backend release/
+          cp -r media release/
+          tar -czvf screen-pilot-x86_64-unknown-linux-gnu-nightly.tar.gz release/
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly-${{ github.run_number }}
+          name: 'Nightly ${{ github.run_number }}'
+          body: |
+            Nightly build of ScreenPilot (Axum + Vue, single binary)
+            - Commit: ${{ github.sha }}
+            - Platform: x86_64-unknown-linux-gnu
+            - Hardware encoding support
+            - Access UI at /web
+          draft: false
+          prerelease: true
+          files: screen-pilot-x86_64-unknown-linux-gnu-nightly.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos-arm:
+    permissions:
+      contents: write
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -45,7 +83,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -56,27 +94,17 @@ jobs:
         working-directory: ./frontend
 
       - name: Build backend
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target aarch64-apple-darwin
         working-directory: ./backend
 
-      - name: Create release archive (Linux/macOS)
-        if: matrix.platform != 'windows-latest'
+      - name: Create release archive
         run: |
           mkdir -p release
-          cp ./backend/target/${{ matrix.target }}/release/${{ matrix.binary_name }} release/
+          cp ./backend/target/aarch64-apple-darwin/release/screen-pilot-backend release/
           cp -r media release/
-          tar -czvf screen-pilot-${{ matrix.target }}-nightly.tar.gz release/
+          tar -czvf screen-pilot-aarch64-apple-darwin-nightly.tar.gz release/
 
-      - name: Create release archive (Windows)
-        if: matrix.platform == 'windows-latest'
-        run: |
-          mkdir -p release
-          cp ./backend/target/${{ matrix.target }}/release/${{ matrix.binary_name }} release/
-          cp -r media release/
-          powershell -Command "Compress-Archive -Path release/* -DestinationPath screen-pilot-${{ matrix.target }}-nightly.zip"
-
-      - name: Upload release asset (Windows)
-        if: matrix.platform == 'windows-latest'
+      - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly-${{ github.run_number }}
@@ -84,18 +112,56 @@ jobs:
           body: |
             Nightly build of ScreenPilot (Axum + Vue, single binary)
             - Commit: ${{ github.sha }}
-            - Date: ${{ github.event.repository.updated_at }}
-            - Platform: ${{ matrix.target }}
-            - Hardware encoding support with auto-detection
+            - Platform: aarch64-apple-darwin (Apple Silicon)
+            - Hardware encoding support
             - Access UI at /web
           draft: false
           prerelease: true
-          files: screen-pilot-${{ matrix.target }}-nightly.zip
+          files: screen-pilot-aarch64-apple-darwin-nightly.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload release asset (Linux/macOS)
-        if: matrix.platform != 'windows-latest'
+  build-macos-intel:
+    permissions:
+      contents: write
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: ./frontend
+
+      - name: Build frontend
+        run: pnpm build
+        working-directory: ./frontend
+
+      - name: Build backend
+        run: cargo build --release --target x86_64-apple-darwin
+        working-directory: ./backend
+
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          cp ./backend/target/x86_64-apple-darwin/release/screen-pilot-backend release/
+          cp -r media release/
+          tar -czvf screen-pilot-x86_64-apple-darwin-nightly.tar.gz release/
+
+      - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly-${{ github.run_number }}
@@ -103,12 +169,66 @@ jobs:
           body: |
             Nightly build of ScreenPilot (Axum + Vue, single binary)
             - Commit: ${{ github.sha }}
-            - Date: ${{ github.event.repository.updated_at }}
-            - Platform: ${{ matrix.target }}
-            - Hardware encoding support with auto-detection
+            - Platform: x86_64-apple-darwin (Intel Mac)
+            - Hardware encoding support
             - Access UI at /web
           draft: false
           prerelease: true
-          files: screen-pilot-${{ matrix.target }}-nightly.tar.gz
+          files: screen-pilot-x86_64-apple-darwin-nightly.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: ./frontend
+
+      - name: Build frontend
+        run: pnpm build
+        working-directory: ./frontend
+
+      - name: Build backend
+        run: cargo build --release
+        working-directory: ./backend
+
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          cp ./backend/target/release/screen-pilot-backend.exe release/
+          cp -r media release/
+          powershell -Command "Compress-Archive -Path release/* -DestinationPath screen-pilot-x86_64-pc-windows-msvc-nightly.zip"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly-${{ github.run_number }}
+          name: 'Nightly ${{ github.run_number }}'
+          body: |
+            Nightly build of ScreenPilot (Axum + Vue, single binary)
+            - Commit: ${{ github.sha }}
+            - Platform: x86_64-pc-windows-msvc
+            - Hardware encoding support
+            - Access UI at /web
+          draft: false
+          prerelease: true
+          files: screen-pilot-x86_64-pc-windows-msvc-nightly.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
