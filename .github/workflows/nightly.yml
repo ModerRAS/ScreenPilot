@@ -38,12 +38,12 @@ jobs:
 
       - name: Build backend
         run: cargo build --release
-        working-directory: ./backend
+        working-directory: .
 
       - name: Create release archive
         run: |
           mkdir -p release
-          cp ./backend/target/release/screen-pilot-backend release/
+          cp ./target/release/screen-pilot-backend release/
           cp -r media release/
           tar -czvf screen-pilot-x86_64-unknown-linux-gnu-nightly.tar.gz release/
 
@@ -53,11 +53,9 @@ jobs:
           tag_name: nightly-${{ github.run_number }}
           name: 'Nightly ${{ github.run_number }}'
           body: |
-            Nightly build of ScreenPilot (Axum + Vue, single binary)
+            Nightly build of ScreenPilot
             - Commit: ${{ github.sha }}
             - Platform: x86_64-unknown-linux-gnu
-            - Hardware encoding support
-            - Access UI at /web
           draft: false
           prerelease: true
           files: screen-pilot-x86_64-unknown-linux-gnu-nightly.tar.gz
@@ -95,12 +93,11 @@ jobs:
 
       - name: Build backend
         run: cargo build --release --target aarch64-apple-darwin
-        working-directory: ./backend
 
       - name: Create release archive
         run: |
           mkdir -p release
-          cp ./backend/target/aarch64-apple-darwin/release/screen-pilot-backend release/
+          cp ./target/aarch64-apple-darwin/release/screen-pilot-backend release/
           cp -r media release/
           tar -czvf screen-pilot-aarch64-apple-darwin-nightly.tar.gz release/
 
@@ -110,11 +107,9 @@ jobs:
           tag_name: nightly-${{ github.run_number }}
           name: 'Nightly ${{ github.run_number }}'
           body: |
-            Nightly build of ScreenPilot (Axum + Vue, single binary)
+            Nightly build of ScreenPilot
             - Commit: ${{ github.sha }}
-            - Platform: aarch64-apple-darwin (Apple Silicon)
-            - Hardware encoding support
-            - Access UI at /web
+            - Platform: aarch64-apple-darwin
           draft: false
           prerelease: true
           files: screen-pilot-aarch64-apple-darwin-nightly.tar.gz
@@ -152,12 +147,11 @@ jobs:
 
       - name: Build backend
         run: cargo build --release --target x86_64-apple-darwin
-        working-directory: ./backend
 
       - name: Create release archive
         run: |
           mkdir -p release
-          cp ./backend/target/x86_64-apple-darwin/release/screen-pilot-backend release/
+          cp ./target/x86_64-apple-darwin/release/screen-pilot-backend release/
           cp -r media release/
           tar -czvf screen-pilot-x86_64-apple-darwin-nightly.tar.gz release/
 
@@ -167,11 +161,9 @@ jobs:
           tag_name: nightly-${{ github.run_number }}
           name: 'Nightly ${{ github.run_number }}'
           body: |
-            Nightly build of ScreenPilot (Axum + Vue, single binary)
+            Nightly build of ScreenPilot
             - Commit: ${{ github.sha }}
-            - Platform: x86_64-apple-darwin (Intel Mac)
-            - Hardware encoding support
-            - Access UI at /web
+            - Platform: x86_64-apple-darwin
           draft: false
           prerelease: true
           files: screen-pilot-x86_64-apple-darwin-nightly.tar.gz
@@ -207,12 +199,11 @@ jobs:
 
       - name: Build backend
         run: cargo build --release
-        working-directory: ./backend
 
       - name: Create release archive
         run: |
           mkdir -p release
-          cp ./backend/target/release/screen-pilot-backend.exe release/
+          cp ./target/release/screen-pilot-backend.exe release/
           cp -r media release/
           powershell -Command "Compress-Archive -Path release/* -DestinationPath screen-pilot-x86_64-pc-windows-msvc-nightly.zip"
 
@@ -222,11 +213,9 @@ jobs:
           tag_name: nightly-${{ github.run_number }}
           name: 'Nightly ${{ github.run_number }}'
           body: |
-            Nightly build of ScreenPilot (Axum + Vue, single binary)
+            Nightly build of ScreenPilot
             - Commit: ${{ github.sha }}
             - Platform: x86_64-pc-windows-msvc
-            - Hardware encoding support
-            - Access UI at /web
           draft: false
           prerelease: true
           files: screen-pilot-x86_64-pc-windows-msvc-nightly.zip
