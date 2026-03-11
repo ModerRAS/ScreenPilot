@@ -3,7 +3,7 @@ import type { RendererDevice, Scene, SceneApplyResult } from '@/types'
 
 const api = axios.create({
   baseURL: '/api',
-  timeout: 15000,
+  timeout: 60000,
 })
 
 export async function getDevices(): Promise<RendererDevice[]> {

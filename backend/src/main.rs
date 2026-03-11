@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -261,7 +261,7 @@ async fn upload_media(
 ) -> Result<StatusCode, ApiError> {
     const ALLOWED_EXTENSIONS: &[&str] = &["mp4", "webm", "avi", "mkv", "mov"];
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         error_response(StatusCode::BAD_REQUEST, format!("Failed to parse multipart: {}", e))
     })? {
         let field_name = field.name().unwrap_or("unknown");
@@ -288,13 +288,23 @@ async fn upload_media(
                 ));
             }
 
-            let data = field.bytes().await.map_err(|e| {
-                error_response(StatusCode::BAD_REQUEST, format!("Failed to read file: {}", e))
+            let dest_path = app.media_dir.join(&filename);
+            
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::File::create(&dest_path).await.map_err(|e| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create file: {}", e))
             })?;
 
-            let dest_path = app.media_dir.join(&filename);
-            tokio::fs::write(&dest_path, data).await.map_err(|e| {
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save file: {}", e))
+            while let Some(chunk) = field.chunk().await.map_err(|e| {
+                error_response(StatusCode::BAD_REQUEST, format!("Failed to read file: {}", e))
+            })? {
+                file.write_all(&chunk).await.map_err(|e| {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e))
+                })?;
+            }
+
+            file.flush().await.map_err(|e| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to flush file: {}", e))
             })?;
 
             return Ok(StatusCode::OK);
@@ -503,7 +513,7 @@ async fn main() {
         .route("/api/devices/:uuid/pause", post(pause_device))
         .route("/api/devices/:uuid/stop", post(stop_device))
         .route("/api/media", get(list_media))
-        .route("/api/media/upload", post(upload_media))
+        .route("/api/media/upload", post(upload_media).layer(DefaultBodyLimit::max(100 * 1024 * 1024 * 1024)))
         .route("/api/scenes", get(get_scenes).post(save_scene))
         .route("/api/scenes/:name", delete(delete_scene))
         .route("/api/scenes/:name/apply", post(apply_scene))

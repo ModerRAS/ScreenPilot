@@ -3,19 +3,61 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use log::{debug, warn};
+use regex::Regex;
 use reqwest::Client;
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::state::RendererDevice;
 
 const SSDP_ADDR: &str = "239.255.255.250";
 const SSDP_PORT: u16 = 1900;
-const SEARCH_TARGET: &str = "urn:schemas-upnp-org:device:MediaRenderer:1";
-const MX: u8 = 3;
+const SEARCH_TARGETS: &[&str] = &[
+    "ssdp:all",
+    "urn:schemas-upnp-org:device:MediaRenderer:1",
+    "urn:schemas-upnp-org:device:MediaRenderer:2",
+];
+const MX: u8 = 3; // 3 seconds per target (total ~10s for 3 targets)
 
-/// Send an M-SEARCH multicast and collect responses for `timeout` seconds.
-/// Returns a list of unique location URLs.
-fn ssdp_search(timeout: Duration) -> Result<Vec<String>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").context("bind UDP socket")?;
+/// Send M-SEARCH multicast for each search target and collect unique location URLs.
+fn ssdp_search(_timeout: Duration) -> Result<Vec<String>> {
+    let mut locations: Vec<String> = Vec::new();
+    let target_timeout = Duration::from_secs(MX as u64 + 1);
+
+    for target in SEARCH_TARGETS {
+        let single_locations = search_single_target(target, target_timeout)?;
+        for loc in single_locations {
+            if !locations.contains(&loc) {
+                locations.push(loc);
+            }
+        }
+        if *target != *SEARCH_TARGETS.last().unwrap() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    Ok(locations)
+}
+
+fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> {
+    let raw_socket =
+        Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).context("create UDP socket")?;
+    raw_socket.set_reuse_address(true).context("set_reuse_address")?;
+
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+    raw_socket.bind(&bind_addr.into()).context("bind UDP socket")?;
+
+    raw_socket
+        .set_multicast_loop_v4(true)
+        .context("set_multicast_loop_v4")?;
+
+    raw_socket
+        .join_multicast_v4(
+            &"239.255.255.250".parse::<Ipv4Addr>().unwrap(),
+            &"0.0.0.0".parse::<Ipv4Addr>().unwrap(),
+        )
+        .context("join_multicast_v4")?;
+
+    let socket: UdpSocket = raw_socket.into();
     socket
         .set_read_timeout(Some(timeout))
         .context("set_read_timeout")?;
@@ -27,7 +69,7 @@ fn ssdp_search(timeout: Duration) -> Result<Vec<String>> {
          MX: {}\r\n\
          ST: {}\r\n\
          \r\n",
-        SSDP_ADDR, SSDP_PORT, MX, SEARCH_TARGET
+        SSDP_ADDR, SSDP_PORT, MX, target
     );
 
     let dest = SocketAddr::new(
@@ -120,11 +162,10 @@ async fn fetch_device_description(
 }
 
 fn extract_xml_text<'a>(xml: &'a str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
+    // Match <tag>content</tag> or <ns:tag>content</ns:tag> where ns is any namespace prefix
+    let re = Regex::new(&format!(r"<(?:\w+:)?{}>([^<]*)</(?:\w+:)?{}>", tag, tag)).ok()?;
+    let caps = re.captures(xml)?;
+    caps.get(1).map(|m| m.as_str().to_string())
 }
 
 /// Find the AVTransport service controlURL within the device description XML.
@@ -307,7 +348,7 @@ mod tests {
     #[test]
     fn test_extract_xml_text_with_namespace() {
         let xml = r#"<root xmlns:u="urn:schemas-upnp-org"><u:friendlyName>Bedroom TV</u:friendlyName></root>"#;
-        assert_eq!(extract_xml_text(xml, "friendlyName"), None);
+        assert_eq!(extract_xml_text(xml, "friendlyName"), Some("Bedroom TV".to_string()));
     }
 
     #[test]
@@ -364,6 +405,6 @@ mod tests {
     fn test_ssdp_constants() {
         assert_eq!(SSDP_ADDR, "239.255.255.250");
         assert_eq!(SSDP_PORT, 1900);
-        assert_eq!(SEARCH_TARGET, "urn:schemas-upnp-org:device:MediaRenderer:1");
+        assert_eq!(SEARCH_TARGETS[1], "urn:schemas-upnp-org:device:MediaRenderer:1");
     }
 }
