@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -254,6 +254,56 @@ async fn list_media(State(app): State<WebAppState>) -> Json<Vec<String>> {
     Json(media_server::list_media_files(&app.media_dir))
 }
 
+/// POST /api/media/upload — upload a media file.
+async fn upload_media(
+    State(app): State<WebAppState>,
+    mut multipart: Multipart,
+) -> Result<StatusCode, ApiError> {
+    const ALLOWED_EXTENSIONS: &[&str] = &["mp4", "webm", "avi", "mkv", "mov"];
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        error_response(StatusCode::BAD_REQUEST, format!("Failed to parse multipart: {}", e))
+    })? {
+        let field_name = field.name().unwrap_or("unknown");
+
+        if field_name == "file" {
+            let filename = field.file_name().ok_or_else(|| {
+                error_response(StatusCode::BAD_REQUEST, "No filename provided")
+            })?.to_string();
+
+            validate_media_filename(&filename)?;
+
+            let ext = filename
+                .rsplit('.')
+                .next()
+                .map(|e| e.to_lowercase())
+                .ok_or_else(|| {
+                    error_response(StatusCode::BAD_REQUEST, "No file extension")
+                })?;
+
+            if !ALLOWED_EXTENSIONS.contains(&ext.as_str()) {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid file extension '{}'. Allowed: {:?}", ext, ALLOWED_EXTENSIONS),
+                ));
+            }
+
+            let data = field.bytes().await.map_err(|e| {
+                error_response(StatusCode::BAD_REQUEST, format!("Failed to read file: {}", e))
+            })?;
+
+            let dest_path = app.media_dir.join(&filename);
+            tokio::fs::write(&dest_path, data).await.map_err(|e| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save file: {}", e))
+            })?;
+
+            return Ok(StatusCode::OK);
+        }
+    }
+
+    Err(error_response(StatusCode::BAD_REQUEST, "No file field in multipart form"))
+}
+
 /// GET /api/scenes — return the list of defined scenes.
 async fn get_scenes(State(app): State<WebAppState>) -> Json<Vec<Scene>> {
     let st = app.shared.read().await;
@@ -452,7 +502,7 @@ async fn main() {
         .route("/api/devices/:uuid/play", post(play_on_device))
         .route("/api/devices/:uuid/pause", post(pause_device))
         .route("/api/devices/:uuid/stop", post(stop_device))
-        .route("/api/media", get(list_media))
+        .route("/api/media", get(list_media).post(upload_media))
         .route("/api/scenes", get(get_scenes).post(save_scene))
         .route("/api/scenes/:name", delete(delete_scene))
         .route("/api/scenes/:name/apply", post(apply_scene))

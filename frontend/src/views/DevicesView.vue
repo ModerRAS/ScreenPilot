@@ -6,6 +6,31 @@ import * as api from '@/api'
 
 const store = useAppStore()
 const selectedMedia = ref<Record<string, string>>({})
+const uploading = ref(false)
+
+async function handleUpload(file: { raw: File }) {
+  uploading.value = true
+  try {
+    await api.uploadMedia(file.raw)
+    ElMessage.success(`Uploaded "${file.raw.name}"`)
+    await store.loadMediaFiles()
+  } catch (e: any) {
+    ElMessage.error(`Upload failed: ${e.message}`)
+    throw e
+  } finally {
+    uploading.value = false
+  }
+}
+
+function beforeUpload(file: File) {
+  const allowedExts = ['.mp4', '.webm', '.avi', '.mkv', '.mov']
+  const ext = file.name.toLowerCase().slice(file.name.lastIndexOf('.'))
+  if (!allowedExts.includes(ext)) {
+    ElMessage.error('Invalid file type. Allowed: mp4, webm, avi, mkv, mov')
+    return false
+  }
+  return true
+}
 
 function statusType(status: string): '' | 'success' | 'warning' | 'info' | 'danger' {
   switch (status) {
@@ -55,6 +80,21 @@ async function stop(uuid: string) {
 
 <template>
   <div>
+    <div style="margin-bottom: 16px">
+      <el-upload
+        :auto-upload="true"
+        :before-upload="beforeUpload"
+        :http-request="handleUpload"
+        :show-file-list="false"
+        accept=".mp4,.webm,.avi,.mkv,.mov"
+        action="#"
+      >
+        <el-button type="primary" :loading="uploading">
+          {{ uploading ? 'Uploading...' : 'Upload Video' }}
+        </el-button>
+      </el-upload>
+    </div>
+
     <el-empty v-if="store.devices.length === 0" description="No devices found. Click Discover Devices to scan the network." />
 
     <el-row :gutter="16">

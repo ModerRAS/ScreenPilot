@@ -33,6 +33,16 @@ export async function listMedia(): Promise<string[]> {
   return data
 }
 
+export async function uploadMedia(file: File): Promise<void> {
+  const formData = new FormData()
+  formData.append('file', file)
+  await api.post('/media/upload', formData, {
+    headers: {
+      'Content-Type': 'multipart/form-data',
+    },
+  })
+}
+
 export async function getScenes(): Promise<Scene[]> {
   const { data } = await api.get<Scene[]>('/scenes')
   return data
