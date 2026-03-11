@@ -61,7 +61,6 @@ fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> 
         .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
         .unwrap_or_else(|| Ipv4Addr::new(0, 0, 0, 0));
 
-    eprintln!("[DEBUG] Using local IP {} for multicast interface", multicast_iface);
     info!("Using local IP {} for multicast interface", multicast_iface);
 
     raw_socket
@@ -223,6 +222,9 @@ fn extract_xml_text<'a>(xml: &'a str, tag: &str) -> Option<String> {
 
 /// Find the AVTransport service controlURL within the device description XML.
 fn find_av_transport_url(xml: &str, location: &str) -> Option<String> {
+    // First try to get URLBase if present
+    let url_base = extract_xml_text(xml, "URLBase");
+    
     // Locate the AVTransport serviceType, then find the next controlURL
     let service_marker = "AVTransport";
     let service_pos = xml.find(service_marker)?;
@@ -235,11 +237,16 @@ fn find_av_transport_url(xml: &str, location: &str) -> Option<String> {
     let path = after[start..end].trim().to_string();
 
     // Build absolute URL
-    let base = base_url(location);
+    let base = url_base
+        .or_else(|| Some(base_url(location)))
+        .unwrap();
+    
     if path.starts_with("http") {
         Some(path)
-    } else {
+    } else if path.starts_with('/') {
         Some(format!("{}{}", base, path))
+    } else {
+        Some(format!("{}/{}", base, path))
     }
 }
 
@@ -452,6 +459,44 @@ mod tests {
         let xml = r#"<root><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType></root>"#;
         let result = find_av_transport_url(xml, "http://192.168.1.5:49152/desc.xml");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_av_transport_url_with_urlbase() {
+        // Xiaomi Redmi TV style: controlURL starts with underscore, URLBase provided
+        let xml = r#"
+            <URLBase>http://192.168.1.123:49152</URLBase>
+            <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+            <controlURL>_urn:schemas-upnp-org:service:AVTransport_control</controlURL>
+        "#;
+        let result = find_av_transport_url(xml, "http://192.168.1.5:49152/desc.xml");
+        assert_eq!(
+            result,
+            Some("http://192.168.1.123:49152/_urn:schemas-upnp-org:service:AVTransport_control".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_av_transport_url_relative_path_with_underscore() {
+        // Relative path starting with underscore (Xiaomi devices)
+        let xml = r#"
+            <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+            <controlURL>_urn:schemas-upnp-org:service:AVTransport_control</controlURL>
+        "#;
+        let result = find_av_transport_url(xml, "http://192.168.1.5:49152/desc.xml");
+        assert_eq!(
+            result,
+            Some("http://192.168.1.5:49152/_urn:schemas-upnp-org:service:AVTransport_control".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_xml_text_urlbase() {
+        let xml = r#"<root><URLBase>http://192.168.1.123:49152</URLBase></root>"#;
+        assert_eq!(
+            extract_xml_text(xml, "URLBase"),
+            Some("http://192.168.1.123:49152".to_string())
+        );
     }
 
     #[test]
