@@ -35,6 +35,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'pnpm'
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -46,20 +47,34 @@ jobs:
         with:
           version: 9
 
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
       - name: Install frontend dependencies
-        working-directory: frontend
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
+        working-directory: ./frontend
 
       - name: Build frontend
-        working-directory: frontend
         run: pnpm build
+        working-directory: ./frontend
 
-      - name: Build backend (frontend embedded)
-        working-directory: backend
+      - name: Build backend
         run: cargo build --release --target ${{ matrix.target }}
+        working-directory: ./backend
 
       - name: Create release archive (Linux/macOS)
         if: matrix.platform != 'windows-latest'
+        shell: bash
         run: |
           mkdir -p release
           cp backend/target/${{ matrix.target }}/release/screen-pilot-backend release/
@@ -68,13 +83,15 @@ jobs:
 
       - name: Create release archive (Windows)
         if: matrix.platform == 'windows-latest'
+        shell: pwsh
         run: |
           mkdir -p release
           cp backend/target/${{ matrix.target }}/release/screen-pilot-backend.exe release/
           cp -r media release/
-          powershell -Command "Compress-Archive -Path release/* -DestinationPath screen-pilot-${{ matrix.target }}-nightly.zip"
+          Compress-Archive -Path release/* -DestinationPath screen-pilot-${{ matrix.target }}-nightly.zip
 
       - name: Upload release asset
+        if: matrix.platform == 'windows-latest'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly-${{ github.run_number }}
@@ -88,7 +105,25 @@ jobs:
             - Access UI at /web
           draft: false
           prerelease: true
-          files: |
-            ${{ matrix.platform == 'windows-latest' && 'screen-pilot-${{ matrix.target }}-nightly.zip' || 'screen-pilot-${{ matrix.target }}-nightly.tar.gz' }}
+          files: screen-pilot-${{ matrix.target }}-nightly.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release asset
+        if: matrix.platform != 'windows-latest'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly-${{ github.run_number }}
+          name: 'Nightly ${{ github.run_number }}'
+          body: |
+            Nightly build of ScreenPilot (Axum + Vue, single binary)
+            - Commit: ${{ github.sha }}
+            - Date: ${{ github.event.repository.updated_at }}
+            - Platform: ${{ matrix.target }}
+            - Hardware encoding support with auto-detection
+            - Access UI at /web
+          draft: false
+          prerelease: true
+          files: screen-pilot-${{ matrix.target }}-nightly.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
