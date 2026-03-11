@@ -7,11 +7,13 @@ mod persistence;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use reqwest::Client;
@@ -401,6 +403,161 @@ impl Drop for FfmpegProcess {
 
 use tokio::time::timeout;
 
+fn get_cache_dir(media_dir: &PathBuf) -> PathBuf {
+    media_dir.join(".cache")
+}
+
+fn get_cache_path(media_dir: &PathBuf, filename: &str, encoder: &HardwareEncoder) -> PathBuf {
+    let cache_dir = get_cache_dir(media_dir);
+    let encoder_suffix = match encoder {
+        HardwareEncoder::None => "libx264",
+        HardwareEncoder::Nvidia => "nvenc",
+        HardwareEncoder::IntelQsv => "qsv",
+        HardwareEncoder::AmdVce => "amf",
+        HardwareEncoder::AppleVtb => "vtb",
+        HardwareEncoder::Vaapi => "vaapi",
+    };
+    let safe_name = filename.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+    let cached_name = format!("{}.{}.ts", safe_name, encoder_suffix);
+    cache_dir.join(cached_name)
+}
+
+fn check_cache(media_dir: &PathBuf, filename: &str, encoder: &HardwareEncoder) -> Option<PathBuf> {
+    let cache_path = get_cache_path(media_dir, filename, encoder);
+    if cache_path.exists() {
+        let original_path = media_dir.join(filename);
+        if let (Ok(original_meta), Ok(cache_meta)) = (original_path.metadata(), cache_path.metadata()) {
+            if let (Ok(original_modified), Ok(cache_modified)) = (original_meta.modified(), cache_meta.modified()) {
+                if cache_modified > original_modified {
+                    log::info!("Cache found: {:?}", cache_path);
+                    return Some(cache_path);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn transcode_to_cache(
+    media_dir: &PathBuf,
+    filename: &str,
+    encoder: &HardwareEncoder,
+) -> Result<PathBuf, String> {
+    let cache_path = get_cache_path(media_dir, filename, encoder);
+    let cache_dir = get_cache_dir(media_dir);
+    
+    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Failed to create cache dir: {}", e))?;
+    
+    let media_path = media_dir.join(filename);
+    let media_path_str = media_path.to_str().unwrap().to_string();
+    let cache_path_str = cache_path.to_str().unwrap().to_string();
+    
+    let (video_args, audio_args) = build_encoder_args(encoder);
+    
+    log::info!("Transcoding to cache with encoder: {:?}", encoder);
+    
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.arg("-y")
+       .arg("-stream_loop").arg("-1")
+       .arg("-re")
+       .arg("-i").arg(&media_path_str);
+    
+    for arg in video_args {
+        cmd.arg(arg);
+    }
+    for arg in audio_args {
+        cmd.arg(arg);
+    }
+    
+    cmd.arg("-f").arg("mpegts")
+       .arg(&cache_path_str);
+    
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("Failed to start ffmpeg for caching: {}", e))?;
+    
+    let start = std::time::Instant::now();
+    let timeout_secs = 3600;
+    
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    log::info!("Cache created successfully: {:?}", cache_path);
+                    return Ok(cache_path);
+                } else {
+                    return Err(format!("Transcoding failed: {:?}", status));
+                }
+            }
+            Ok(None) => {
+                if start.elapsed().as_secs() > timeout_secs {
+                    let _ = child.kill();
+                    return Err("Transcoding timeout".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(format!("Error waiting for ffmpeg: {}", e));
+            }
+        }
+    }
+}
+
+fn serve_cached_file(cache_path: &PathBuf) -> impl axum::response::IntoResponse {
+    use std::io::Read;
+    
+    let cache_path_str = cache_path.to_str().unwrap().to_string();
+    
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.arg("-re")
+       .arg("-i").arg(&cache_path_str)
+       .arg("-c").arg("copy")
+       .arg("-f").arg("mpegts")
+       .arg("-")
+       .arg("-nostdin");
+    
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    let mut child = cmd.spawn().expect("Failed to start ffmpeg");
+    
+    let mut stdout = child.stdout.take().expect("Failed to capture output");
+    
+    let _ = std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    
+    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
+    
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    
+    let stream = async_stream::stream! {
+        while let Some(chunk) = rx.recv().await {
+            yield chunk;
+        }
+    };
+    
+    (
+        [("Content-Type", "video/mp2t")],
+        axum::body::Body::from_stream(stream)
+    )
+}
+
 
 /// Helper function to spawn ffmpeg stream with a specific encoder.
 /// Returns Ok if stream starts successfully, Err with error message if it fails.
@@ -510,7 +667,7 @@ async fn spawn_ffmpeg_stream(
 async fn stream_media(
     State(app): State<WebAppState>,
     Path(filename): Path<String>,
-) -> Result<impl axum::response::IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     validate_media_filename(&filename)?;
     
     let media_path = app.media_dir.join(&filename);
@@ -526,32 +683,42 @@ async fn stream_media(
     let hw_encoder = get_encoder_from_preference(&encoder_pref);
     log::info!("Using encoder preference: {} -> {:?}", encoder_pref, hw_encoder);
     
-    // First try with hardware encoder (if available)
+    // Check cache first
+    if let Some(cache_path) = check_cache(&app.media_dir, &filename, &hw_encoder) {
+        log::info!("Using cached transcoded file with codec copy");
+        return Ok(serve_cached_file(&cache_path).into_response());
+    }
+    
+    // No cache - transcode while streaming
     if !matches!(hw_encoder, HardwareEncoder::None) {
         match timeout(Duration::from_secs(5), spawn_ffmpeg_stream(&app.media_dir, &filename, &hw_encoder)).await {
             Ok(Ok((mut rx, _stderr_thread))) => {
-                // Hardware encoder started, verify it actually produces output
                 match timeout(Duration::from_secs(3), async { rx.recv().await }).await {
                     Ok(Some(Ok(_chunk))) => {
                         log::debug!("Hardware encoder {:?} started successfully", hw_encoder);
                     }
                     Ok(Some(Err(e))) => {
                         log::warn!("Hardware encoder {:?} produced error: {}. Falling back to software.", hw_encoder, e);
-                        // Fall through to software encoder
                     }
                     Ok(None) => {
                         log::warn!("Hardware encoder {:?} stream ended unexpectedly. Falling back to software.", hw_encoder);
-                        // Fall through to software encoder
                     }
                     Err(_) => {
                         log::warn!("Hardware encoder {:?} may have failed to initialize (no output within 3s). Falling back to software.", hw_encoder);
-                        // Fall through to software encoder
                     }
                 }
                 
-                // If we got here with a working stream, use it
-                // Otherwise fall through to software encoder
                 if matches!(timeout(Duration::from_secs(1), async { rx.recv().await }).await, Ok(Some(Ok(_)))) {
+                    // Start background cache transcoding (while streaming)
+                    let media_dir_for_cache = app.media_dir.clone();
+                    let filename_for_cache = filename.clone();
+                    let encoder_for_cache = hw_encoder.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = transcode_to_cache(&media_dir_for_cache, &filename_for_cache, &encoder_for_cache).await {
+                            log::error!("Failed to create cache: {}", e);
+                        }
+                    });
+                    
                     let stream = async_stream::stream! {
                         while let Some(chunk) = rx.recv().await {
                             yield chunk;
@@ -561,16 +728,14 @@ async fn stream_media(
                     return Ok((
                         [("Content-Type", "video/mp2t")],
                         axum::body::Body::from_stream(stream)
-                    ));
+                    ).into_response());
                 }
             }
             Ok(Err(e)) => {
                 log::warn!("Hardware encoder {:?} failed to start: {}. Falling back to software.", hw_encoder, e);
-                // Fall through to software encoder
             }
             Err(_) => {
                 log::warn!("Hardware encoder {:?} timed out during initialization. Falling back to software.", hw_encoder);
-                // Fall through to software encoder
             }
         }
     }
@@ -583,6 +748,15 @@ async fn stream_media(
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     
+    // Start background cache transcoding while streaming (with loop for infinite playback)
+    let media_dir_for_cache = app.media_dir.clone();
+    let filename_for_cache = filename.clone();
+    tokio::spawn(async move {
+        if let Err(e) = transcode_to_cache(&media_dir_for_cache, &filename_for_cache, &software_encoder).await {
+            log::error!("Failed to create cache: {}", e);
+        }
+    });
+    
     let stream = async_stream::stream! {
         while let Some(chunk) = rx.recv().await {
             yield chunk;
@@ -592,7 +766,7 @@ async fn stream_media(
     Ok((
         [("Content-Type", "video/mp2t")],
         axum::body::Body::from_stream(stream)
-    ))
+    ).into_response())
 }
 
 /// POST /api/media/upload
