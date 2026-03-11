@@ -84,11 +84,11 @@ jobs:
             - Commit: ${{ github.sha }}
             - Date: ${{ github.event.repository.updated_at }}
             - Platform: ${{ matrix.target }}
+            - Hardware encoding support with auto-detection
             - Access UI at /web
           draft: false
           prerelease: true
           files: |
-            screen-pilot-${{ matrix.target }}-nightly.tar.gz
-            screen-pilot-${{ matrix.target }}-nightly.zip
+            ${{ matrix.platform == 'windows-latest' && 'screen-pilot-${{ matrix.target }}-nightly.zip' || 'screen-pilot-${{ matrix.target }}-nightly.tar.gz' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

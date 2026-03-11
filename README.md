@@ -106,6 +106,49 @@ cd frontend && pnpm preview
 | DELETE | `/api/scenes/:name` | Delete a scene |
 | POST | `/api/scenes/:name/apply` | Apply scene to devices |
 | GET | `/api/config/media-server-url` | Get media server URL |
+| GET | `/api/config/encoder` | Get encoder preference |
+| PUT | `/api/config/encoder` | Set encoder preference |
+
+## Hardware Encoding
+
+ScreenPilot supports hardware-accelerated video encoding for streaming. The system automatically detects available hardware encoders or allows manual selection.
+
+### Supported Encoders
+
+| Encoder | Description | Platform |
+|---------|-------------|----------|
+| `auto` | Auto-detect best available hardware encoder | All |
+| `nvidia` | NVIDIA NVENC | Windows/Linux |
+| `amd` | AMD VCE (AMF) | Windows |
+| `intel` | Intel Quick Sync Video (QSV) | Windows/Linux |
+| `apple` | Apple VideoToolbox | macOS |
+| `software` | Software encoding (libx264) | All |
+
+### Encoder API
+
+```bash
+# Get current encoder preference
+GET /api/config/encoder
+# Response: "auto" | "nvidia" | "amd" | "intel" | "apple" | "software"
+
+# Set encoder preference
+PUT /api/config/encoder
+# Body: { "encoder": "amd" }
+```
+
+### How It Works
+
+1. **Detection Order**: When set to `auto`, the system checks for encoders in this order: AMD → NVIDIA → Intel → Apple → VAAPI → Software
+2. **Fallback**: If the selected hardware encoder fails to initialize, the system automatically falls back to software encoding (libx264)
+3. **Streaming**: Video is encoded with CQP 18 (high quality) and audio with AAC 256k, output as MPEG-TS for DLNA compatibility
+4. **Infinite Loop**: Media files loop infinitely using ffmpeg's `-stream_loop -1` option
+
+### Troubleshooting
+
+If hardware encoding doesn't work:
+- Select `software` to use CPU encoding instead
+- Check ffmpeg logs for error messages (e.g., "Cannot load nvcuda.dll" for NVIDIA)
+- Ensure appropriate GPU drivers are installed
 
 ## Rust Modules (Backend)
 

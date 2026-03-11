@@ -104,6 +104,49 @@ cd frontend && pnpm preview
 | DELETE | `/api/scenes/:name` | 删除场景 |
 | POST | `/api/scenes/:name/apply` | 应用场景到设备 |
 | GET | `/api/config/media-server-url` | 获取媒体服务器 URL |
+| GET | `/api/config/encoder` | 获取编码器偏好设置 |
+| PUT | `/api/config/encoder` | 设置编码器偏好设置 |
+
+## 硬件编码
+
+ScreenPilot 支持硬件加速视频编码进行流媒体播放。系统会自动检测可用的硬件编码器，也支持手动选择。
+
+### 支持的编码器
+
+| 编码器 | 说明 | 平台 |
+|--------|------|------|
+| `auto` | 自动检测最佳可用硬件编码器 | 全平台 |
+| `nvidia` | NVIDIA NVENC | Windows/Linux |
+| `amd` | AMD VCE (AMF) | Windows |
+| `intel` | Intel Quick Sync Video (QSV) | Windows/Linux |
+| `apple` | Apple VideoToolbox | macOS |
+| `software` | 软件编码 (libx264) | 全平台 |
+
+### 编码器 API
+
+```bash
+# 获取当前编码器偏好
+GET /api/config/encoder
+# 返回: "auto" | "nvidia" | "amd" | "intel" | "apple" | "software"
+
+# 设置编码器偏好
+PUT /api/config/encoder
+# Body: { "encoder": "amd" }
+```
+
+### 工作原理
+
+1. **检测顺序**: 设置为 `auto` 时，系统按以下顺序检测：AMD → NVIDIA → Intel → Apple → VAAPI → 软件
+2. **自动回退**: 如果选中的硬件编码器初始化失败，系统自动回退到软件编码 (libx264)
+3. **流媒体**: 视频使用 CQP 18（高质量）编码，音频使用 AAC 256k，输出 MPEG-TS 格式以兼容 DLNA
+4. **无限循环**: 使用 ffmpeg 的 `-stream_loop -1` 选项实现媒体文件无限循环播放
+
+### 故障排除
+
+如果硬件编码不工作：
+- 选择 `software` 改用 CPU 编码
+- 查看 ffmpeg 日志中的错误信息（如 NVIDIA 的 "Cannot load nvcuda.dll"）
+- 确保已安装对应的 GPU 驱动
 
 ## Rust 模块说明（后端）
 
