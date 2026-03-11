@@ -199,7 +199,7 @@ async fn play_on_device(
                     format!("Device not found: {}", device_uuid),
                 )
             })?;
-        let uri = format!("{}/api/media/stream/{}", st.media_server_base_url, body.media_filename);
+        let uri = format!("{}/media/{}", st.media_server_base_url, body.media_filename);
         (device.av_transport_url.clone(), uri)
     };
 
@@ -388,79 +388,24 @@ async fn stream_media(
     }
     
     let media_path_str = media_path.to_str().unwrap().to_string();
-    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
     
-    let is_streamable = matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "avi" | "mov");
-    
-    if is_streamable {
-        let mut child = Command::new("ffmpeg")
-            .args([
-                "-stream_loop", "-1",
-                "-re",
-                "-i", &media_path_str,
-                "-c:v", "copy",
-                "-c:a", "copy",
-                "-f", "mpegts",
-                "-",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start ffmpeg: {}", e)))?;
-        
-        let mut stdout = child.stdout.take().ok_or_else(|| 
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to capture ffmpeg output"))?;
-        
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
-        
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 65536];
-            loop {
-                match stdout.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        
-        let stream = async_stream::stream! {
-            for chunk in rx {
-                yield chunk;
-            }
-        };
-        
-        return Ok((
-            [("Content-Type", "video/mp2t")],
-            axum::body::Body::from_stream(stream)
-        ));
-    }
-    
-    let hw_encoder = detect_hardware_encoder();
-    let (video_args, audio_args) = build_encoder_args(&hw_encoder);
-    
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-stream_loop").arg("-1");
-    cmd.arg("-re");
-    cmd.arg("-i").arg(&media_path_str);
-    
-    for arg in video_args {
-        cmd.arg(arg);
-    }
-    for arg in audio_args {
-        cmd.arg(arg);
-    }
-    
-    cmd.arg("-f").arg("mpegts");
-    cmd.arg("-");
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    
-    let mut child = cmd.spawn()
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-stream_loop", "-1",
+            "-re",
+            "-i", &media_path_str,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-s", "1920x1080",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-f", "matroska",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start ffmpeg: {}", e)))?;
     
     let mut stdout = child.stdout.take().ok_or_else(|| 
@@ -469,7 +414,7 @@ async fn stream_media(
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
     
     std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 65536];
         loop {
             match stdout.read(&mut buf) {
                 Ok(0) => break,
@@ -490,7 +435,7 @@ async fn stream_media(
     };
     
     Ok((
-        [("Content-Type", "video/mp2t")],
+        [("Content-Type", "video/x-matroska")],
         axum::body::Body::from_stream(stream)
     ))
 }
@@ -625,7 +570,7 @@ async fn apply_scene(
                 continue;
             }
         };
-        let media_uri = format!("{}/api/media/stream/{}", media_base, filename);
+        let media_uri = format!("{}/media/{}", media_base, filename);
         let client = app.client.lock().await;
         match dlna::play_media(&client, &av_url, &media_uri).await {
             Ok(_) => {
