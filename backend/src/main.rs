@@ -17,6 +17,7 @@ use axum::{Json, Router};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc as tokio_mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
@@ -296,6 +297,7 @@ fn detect_hardware_encoder() -> HardwareEncoder {
                 log::info!("Using Apple VideoToolbox hardware encoding");
                 return HardwareEncoder::AppleVtb;
             }
+            #[cfg(target_os = "linux")]
             if encoders.contains("h264_vaapi") {
                 log::info!("Using VAAPI hardware encoding");
                 return HardwareEncoder::VAAPI;
@@ -317,8 +319,8 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-c:v", "h264_nvenc",
                 "-preset", "p4",
                 "-tune", "ll",
-                "-rc", "vbr",
-                "-cq", "18",
+                "-rc", "constqp",
+                "-qp", "18",
                 "-bf", "3",
             ],
             vec!["-c:a", "aac", "-b:a", "256k"],
@@ -327,8 +329,7 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
             vec![
                 "-c:v", "h264_qsv",
                 "-preset", "veryfast",
-                "-look_ahead", "0",
-                "-q", "18",
+                "-global_quality", "18",
             ],
             vec!["-c:a", "aac", "-b:a", "256k"],
         ),
@@ -344,8 +345,7 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
             vec![
                 "-c:v", "h264_videotoolbox",
                 "-profile:v", "high",
-                "-quantizer", "18",
-                "-realtime",
+                "-q", "18",
             ],
             vec!["-c:a", "aac", "-b:a", "256k"],
         ),
@@ -370,6 +370,21 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
     }
 }
 
+struct FfmpegProcess {
+    child: std::process::Child,
+}
+
+impl Drop for FfmpegProcess {
+    fn drop(&mut self) {
+        if let Err(e) = self.child.kill() {
+            log::warn!("Failed to kill ffmpeg: {}", e);
+        }
+    }
+}
+
+use tokio::time::timeout;
+
+
 async fn stream_media(
     State(app): State<WebAppState>,
     Path(filename): Path<String>,
@@ -388,6 +403,8 @@ async fn stream_media(
     
     let hw_encoder = detect_hardware_encoder();
     let (video_args, audio_args) = build_encoder_args(&hw_encoder);
+    
+    log::info!("Starting stream with encoder: {:?}", hw_encoder);
     
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-stream_loop").arg("-1");
@@ -408,13 +425,46 @@ async fn stream_media(
     
     let mut child = cmd.spawn()
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start ffmpeg: {}", e)))?;
-    
+
     let mut stdout = child.stdout.take().ok_or_else(|| 
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to capture ffmpeg output"))?;
+
+    let mut ffmpeg = FfmpegProcess { child };
+
+    let hw_encoder_for_check = hw_encoder.clone();
+    let _stderr_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut error_count = 0;
+        if let Some(stderr) = ffmpeg.child.stderr.take() {
+            let mut stderr = stderr;
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let msg = String::from_utf8_lossy(&buf[..n]);
+                        if msg.to_lowercase().contains("error") 
+                            || msg.to_lowercase().contains("failed")
+                            || msg.to_lowercase().contains("cannot")
+                            || msg.to_lowercase().contains("invalid") {
+                            error_count += 1;
+                            log::error!("ffmpeg: {}", msg);
+                        } else {
+                            log::warn!("ffmpeg: {}", msg);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if error_count > 0 && !matches!(hw_encoder_for_check, HardwareEncoder::None) {
+            log::warn!("Hardware encoder {:?} may have failed. Consider restarting with software encoder", hw_encoder_for_check);
+        }
+    });
     
-    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
+    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
     
-    std::thread::spawn(move || {
+    let _stdout_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 65536];
         loop {
             match stdout.read(&mut buf) {
@@ -429,8 +479,29 @@ async fn stream_media(
         }
     });
     
+    if !matches!(hw_encoder, HardwareEncoder::None) {
+        let check_result = timeout(Duration::from_secs(3), async {
+            rx.recv().await
+        }).await;
+        
+        match check_result {
+            Ok(Some(Ok(_chunk))) => {
+                log::debug!("Hardware encoder {:?} started successfully", hw_encoder);
+            }
+            Ok(Some(Err(e))) => {
+                log::warn!("Hardware encoder {:?} produced error: {}. Consider using software encoder.", hw_encoder, e);
+            }
+            Ok(None) => {
+                log::warn!("Hardware encoder {:?} stream ended unexpectedly. Consider using software encoder.", hw_encoder);
+            }
+            Err(_) => {
+                log::warn!("Hardware encoder {:?} may have failed to initialize (no output within 3s). Consider using software encoder by restarting.", hw_encoder);
+            }
+        }
+    }
+    
     let stream = async_stream::stream! {
-        for chunk in rx {
+        while let Some(chunk) = rx.recv().await {
             yield chunk;
         }
     };
