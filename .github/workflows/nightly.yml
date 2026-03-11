@@ -51,17 +51,17 @@ jobs:
         working-directory: ./frontend
 
       - name: Build backend
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          ls -la backend/target/${{ matrix.target }}/release/
         working-directory: ./backend
 
       - name: Create release archive (Linux/macOS)
         if: matrix.platform != 'windows-latest'
         shell: bash
         run: |
-          BINARY_PATH=$(find backend/target -name "screen-pilot-backend" -type f 2>/dev/null | head -1)
-          echo "Found binary: $BINARY_PATH"
           mkdir -p release
-          cp "$BINARY_PATH" release/
+          cp backend/target/${{ matrix.target }}/release/screen-pilot-backend release/
           cp -r media release/
           tar -czvf screen-pilot-${{ matrix.target }}-nightly.tar.gz release/
 
@@ -69,12 +69,10 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          $BINARY_PATH = Get-ChildItem -Path backend/target -Filter "*.exe" -Recurse | Select-Object -ExpandProperty FullName
-          Write-Host "Found binary: $BINARY_PATH"
-          New-Item -ItemType Directory -Path release -Force
-          Copy-Item "$BINARY_PATH" release/
-          Copy-Item -Path "media" -Destination "release/" -Recurse -Force
-          Compress-Archive -Path "release/*" -DestinationPath "screen-pilot-${{ matrix.target }}-nightly.zip" -Force
+          mkdir -p release
+          cp backend/target/${{ matrix.target }}/release/screen-pilot-backend.exe release/
+          cp -r media release/
+          Compress-Archive -Path release/* -DestinationPath screen-pilot-${{ matrix.target }}-nightly.zip -Force
 
       - name: Upload release asset
         if: matrix.platform == 'windows-latest'
