@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useAppStore } from '@/stores/app'
 import * as api from '@/api'
@@ -8,6 +8,10 @@ const store = useAppStore()
 const selectedMedia = ref<Record<string, string>>({})
 const uploading = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
+
+onMounted(async () => {
+  await store.loadEncoder()
+})
 
 async function triggerUpload() {
   fileInput.value?.click()
@@ -75,10 +79,32 @@ async function stop(uuid: string) {
     ElMessage.error(`Stop failed: ${e.message}`)
   }
 }
+
+async function handleEncoderChange(value: string) {
+  try {
+    await store.setEncoder(value)
+    ElMessage.success(`Encoder set to ${value}`)
+  } catch (e: any) {
+    ElMessage.error('Failed to set encoder')
+  }
+}
 </script>
 
 <template>
   <div>
+    <!-- Encoder selection -->
+    <div style="margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+      <span>Encoder:</span>
+      <el-select v-model="store.encoder" @change="handleEncoderChange">
+        <el-option label="Auto (Hardware)" value="auto" />
+        <el-option label="NVIDIA" value="nvidia" />
+        <el-option label="AMD" value="amd" />
+        <el-option label="Intel" value="intel" />
+        <el-option label="Apple" value="apple" />
+        <el-option label="Software (CPU)" value="software" />
+      </el-select>
+    </div>
+
     <div style="margin-bottom: 16px">
       <input
         ref="fileInput"

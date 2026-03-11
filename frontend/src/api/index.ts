@@ -61,3 +61,12 @@ export async function getMediaServerUrl(): Promise<string> {
   const { data } = await api.get<string>('/config/media-server-url')
   return data
 }
+
+export async function getEncoder(): Promise<string> {
+  const { data } = await api.get<string>('/config/encoder')
+  return data
+}
+
+export async function setEncoder(encoder: string): Promise<void> {
+  await api.put('/config/encoder', { encoder })
+}

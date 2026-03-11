@@ -281,22 +281,27 @@ fn detect_hardware_encoder() -> HardwareEncoder {
     match output {
         Ok(o) => {
             let encoders = String::from_utf8_lossy(&o.stdout);
+            
+            if encoders.contains("h264_amf") {
+                log::info!("Using AMD GPU hardware encoding (VCE)");
+                return HardwareEncoder::AmdVce;
+            }
+            
             if encoders.contains("h264_nvenc") {
                 log::info!("Using NVIDIA GPU hardware encoding");
                 return HardwareEncoder::Nvidia;
             }
+            
             if encoders.contains("h264_qsv") {
                 log::info!("Using Intel Quick Sync Video hardware encoding");
                 return HardwareEncoder::IntelQsv;
             }
-            if encoders.contains("h264_amf") {
-                log::info!("Using AMD GPU hardware encoding");
-                return HardwareEncoder::AmdVce;
-            }
+            
             if encoders.contains("h264_videotoolbox") {
                 log::info!("Using Apple VideoToolbox hardware encoding");
                 return HardwareEncoder::AppleVtb;
             }
+            
             #[cfg(target_os = "linux")]
             if encoders.contains("h264_vaapi") {
                 log::info!("Using VAAPI hardware encoding");
@@ -310,6 +315,17 @@ fn detect_hardware_encoder() -> HardwareEncoder {
     
     log::info!("No hardware encoder found, using software encoding");
     HardwareEncoder::None
+}
+
+fn get_encoder_from_preference(pref: &str) -> HardwareEncoder {
+    match pref {
+        "nvidia" => HardwareEncoder::Nvidia,
+        "amd" => HardwareEncoder::AmdVce,
+        "intel" => HardwareEncoder::IntelQsv,
+        "apple" => HardwareEncoder::AppleVtb,
+        "software" => HardwareEncoder::None,
+        _ => detect_hardware_encoder(),
+    }
 }
 
 fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static str>) {
@@ -385,26 +401,26 @@ impl Drop for FfmpegProcess {
 use tokio::time::timeout;
 
 
-async fn stream_media(
-    State(app): State<WebAppState>,
-    Path(filename): Path<String>,
-) -> Result<impl axum::response::IntoResponse, ApiError> {
+/// Helper function to spawn ffmpeg stream with a specific encoder.
+/// Returns Ok if stream starts successfully, Err with error message if it fails.
+async fn spawn_ffmpeg_stream(
+    media_dir: &PathBuf,
+    filename: &str,
+    encoder: &HardwareEncoder,
+) -> Result<(tokio::sync::mpsc::UnboundedReceiver<Result<Vec<u8>, std::io::Error>>, std::thread::JoinHandle<()>), String> {
     use std::process::{Command, Stdio};
     use std::io::Read;
     
-    validate_media_filename(&filename)?;
-    
-    let media_path = app.media_dir.join(&filename);
+    let media_path = media_dir.join(filename);
     if !media_path.exists() {
-        return Err(error_response(StatusCode::NOT_FOUND, "Media file not found"));
+        return Err("Media file not found".to_string());
     }
     
     let media_path_str = media_path.to_str().unwrap().to_string();
     
-    let hw_encoder = detect_hardware_encoder();
-    let (video_args, audio_args) = build_encoder_args(&hw_encoder);
+    let (video_args, audio_args) = build_encoder_args(encoder);
     
-    log::info!("Starting stream with encoder: {:?}", hw_encoder);
+    log::info!("Starting stream with encoder: {:?}", encoder);
     
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-stream_loop").arg("-1");
@@ -424,17 +440,17 @@ async fn stream_media(
     cmd.stderr(Stdio::piped());
     
     let mut child = cmd.spawn()
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start ffmpeg: {}", e)))?;
+        .map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
 
     let mut stdout = child.stdout.take().ok_or_else(|| 
-        error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to capture ffmpeg output"))?;
+        "Failed to capture ffmpeg output".to_string())?;
 
     let mut ffmpeg = FfmpegProcess { child };
-
-    let hw_encoder_for_check = hw_encoder.clone();
-    let _stderr_thread = std::thread::spawn(move || {
+    
+    let encoder_for_check = encoder.clone();
+    let stderr_thread = std::thread::spawn(move || {
         use std::io::Read;
-        let mut error_count = 0;
+        let mut error_output = String::new();
         if let Some(stderr) = ffmpeg.child.stderr.take() {
             let mut stderr = stderr;
             let mut buf = [0u8; 4096];
@@ -443,11 +459,11 @@ async fn stream_media(
                     Ok(0) => break,
                     Ok(n) => {
                         let msg = String::from_utf8_lossy(&buf[..n]);
+                        error_output.push_str(&msg);
                         if msg.to_lowercase().contains("error") 
                             || msg.to_lowercase().contains("failed")
                             || msg.to_lowercase().contains("cannot")
                             || msg.to_lowercase().contains("invalid") {
-                            error_count += 1;
                             log::error!("ffmpeg: {}", msg);
                         } else {
                             log::warn!("ffmpeg: {}", msg);
@@ -457,12 +473,19 @@ async fn stream_media(
                 }
             }
         }
-        if error_count > 0 && !matches!(hw_encoder_for_check, HardwareEncoder::None) {
-            log::warn!("Hardware encoder {:?} may have failed. Consider restarting with software encoder", hw_encoder_for_check);
+        // Check for hardware encoder specific failures
+        if !matches!(encoder_for_check, HardwareEncoder::None) {
+            let lower = error_output.to_lowercase();
+            if lower.contains("cannot load") 
+                || lower.contains("failed to open")
+                || lower.contains("not found")
+                || lower.contains("no device") {
+                log::warn!("Hardware encoder {:?} failed to initialize: {}", encoder_for_check, error_output);
+            }
         }
     });
     
-    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
+    let (tx, rx) = tokio_mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
     
     let _stdout_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 65536];
@@ -479,26 +502,85 @@ async fn stream_media(
         }
     });
     
+    Ok((rx, stderr_thread))
+}
+
+
+async fn stream_media(
+    State(app): State<WebAppState>,
+    Path(filename): Path<String>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    validate_media_filename(&filename)?;
+    
+    let media_path = app.media_dir.join(&filename);
+    if !media_path.exists() {
+        return Err(error_response(StatusCode::NOT_FOUND, "Media file not found"));
+    }
+    
+    let encoder_pref = {
+        let st = app.shared.read().await;
+        st.preferred_encoder.clone()
+    };
+    
+    let hw_encoder = get_encoder_from_preference(&encoder_pref);
+    log::info!("Using encoder preference: {} -> {:?}", encoder_pref, hw_encoder);
+    
+    // First try with hardware encoder (if available)
     if !matches!(hw_encoder, HardwareEncoder::None) {
-        let check_result = timeout(Duration::from_secs(3), async {
-            rx.recv().await
-        }).await;
-        
-        match check_result {
-            Ok(Some(Ok(_chunk))) => {
-                log::debug!("Hardware encoder {:?} started successfully", hw_encoder);
+        match timeout(Duration::from_secs(5), spawn_ffmpeg_stream(&app.media_dir, &filename, &hw_encoder)).await {
+            Ok(Ok((mut rx, _stderr_thread))) => {
+                // Hardware encoder started, verify it actually produces output
+                match timeout(Duration::from_secs(3), async { rx.recv().await }).await {
+                    Ok(Some(Ok(_chunk))) => {
+                        log::debug!("Hardware encoder {:?} started successfully", hw_encoder);
+                    }
+                    Ok(Some(Err(e))) => {
+                        log::warn!("Hardware encoder {:?} produced error: {}. Falling back to software.", hw_encoder, e);
+                        // Fall through to software encoder
+                    }
+                    Ok(None) => {
+                        log::warn!("Hardware encoder {:?} stream ended unexpectedly. Falling back to software.", hw_encoder);
+                        // Fall through to software encoder
+                    }
+                    Err(_) => {
+                        log::warn!("Hardware encoder {:?} may have failed to initialize (no output within 3s). Falling back to software.", hw_encoder);
+                        // Fall through to software encoder
+                    }
+                }
+                
+                // If we got here with a working stream, use it
+                // Otherwise fall through to software encoder
+                if matches!(timeout(Duration::from_secs(1), async { rx.recv().await }).await, Ok(Some(Ok(_)))) {
+                    let stream = async_stream::stream! {
+                        while let Some(chunk) = rx.recv().await {
+                            yield chunk;
+                        }
+                    };
+                    
+                    return Ok((
+                        [("Content-Type", "video/mp2t")],
+                        axum::body::Body::from_stream(stream)
+                    ));
+                }
             }
-            Ok(Some(Err(e))) => {
-                log::warn!("Hardware encoder {:?} produced error: {}. Consider using software encoder.", hw_encoder, e);
-            }
-            Ok(None) => {
-                log::warn!("Hardware encoder {:?} stream ended unexpectedly. Consider using software encoder.", hw_encoder);
+            Ok(Err(e)) => {
+                log::warn!("Hardware encoder {:?} failed to start: {}. Falling back to software.", hw_encoder, e);
+                // Fall through to software encoder
             }
             Err(_) => {
-                log::warn!("Hardware encoder {:?} may have failed to initialize (no output within 3s). Consider using software encoder by restarting.", hw_encoder);
+                log::warn!("Hardware encoder {:?} timed out during initialization. Falling back to software.", hw_encoder);
+                // Fall through to software encoder
             }
         }
     }
+    
+    // Fall back to software encoder
+    let software_encoder = HardwareEncoder::None;
+    log::info!("Using software encoder (libx264)");
+    
+    let (mut rx, _stderr_thread) = spawn_ffmpeg_stream(&app.media_dir, &filename, &software_encoder)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     
     let stream = async_stream::stream! {
         while let Some(chunk) = rx.recv().await {
@@ -676,6 +758,31 @@ async fn get_media_server_url(State(app): State<WebAppState>) -> Json<String> {
     Json(st.media_server_base_url.clone())
 }
 
+/// GET /api/config/encoder — get current encoder preference.
+async fn get_encoder(State(app): State<WebAppState>) -> Json<String> {
+    let st = app.shared.read().await;
+    Json(st.preferred_encoder.clone())
+}
+
+/// PUT /api/config/encoder — set encoder preference.
+async fn set_encoder(
+    State(app): State<WebAppState>,
+    Json(body): Json<SetEncoderRequest>,
+) -> Result<StatusCode, ApiError> {
+    let valid = ["auto", "nvidia", "amd", "intel", "apple", "software"];
+    if !valid.contains(&body.encoder.as_str()) {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Invalid encoder"));
+    }
+    let mut st = app.shared.write().await;
+    st.preferred_encoder = body.encoder;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct SetEncoderRequest {
+    encoder: String,
+}
+
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
 async fn resolve_av_url(app: &WebAppState, uuid: &str) -> Result<String, String> {
@@ -733,6 +840,7 @@ async fn main() {
         s.devices = persistence::load_devices();
         log::info!("Loaded {} devices from persistence", s.devices.len());
         s.media_server_base_url = media_base_url;
+        s.preferred_encoder = "auto".to_string();
     }
 
     // Background discovery loop
@@ -790,6 +898,7 @@ async fn main() {
         .route("/api/scenes/:name", delete(delete_scene))
         .route("/api/scenes/:name/apply", post(apply_scene))
         .route("/api/config/media-server-url", get(get_media_server_url))
+        .route("/api/config/encoder", get(get_encoder).put(set_encoder))
         .nest_service("/media", ServeDir::new(media_dir.clone()))
         .route("/web/assets/*path", get(serve_assets))
         .route("/web/favicon.ico", get(serve_favicon))

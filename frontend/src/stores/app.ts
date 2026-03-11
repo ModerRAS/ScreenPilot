@@ -8,6 +8,7 @@ export const useAppStore = defineStore('app', () => {
   const mediaFiles = ref<string[]>([])
   const scenes = ref<Scene[]>([])
   const mediaServerUrl = ref('')
+  const encoder = ref('auto')
   const isDiscovering = ref(false)
 
   async function loadDevices() {
@@ -35,16 +36,28 @@ export const useAppStore = defineStore('app', () => {
     mediaServerUrl.value = await api.getMediaServerUrl()
   }
 
+  async function loadEncoder() {
+    encoder.value = await api.getEncoder()
+  }
+
+  async function setEncoder(value: string) {
+    await api.setEncoder(value)
+    encoder.value = value
+  }
+
   return {
     devices,
     mediaFiles,
     scenes,
     mediaServerUrl,
+    encoder,
     isDiscovering,
     loadDevices,
     discoverDevices,
     loadMediaFiles,
     loadScenes,
     loadMediaServerUrl,
+    loadEncoder,
+    setEncoder,
   }
 })

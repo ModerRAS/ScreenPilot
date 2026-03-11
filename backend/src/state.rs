@@ -52,6 +52,8 @@ pub struct AppState {
     pub scenes: Vec<Scene>,
     /// Base URL for the media server, e.g. "http://192.168.1.10:8090"
     pub media_server_base_url: String,
+    /// Preferred encoder: "auto", "nvidia", "amd", "intel", "apple", "software"
+    pub preferred_encoder: String,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
