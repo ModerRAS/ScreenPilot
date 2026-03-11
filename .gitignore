@@ -29,3 +29,7 @@ frontend/dist/
 .sisyphus
 
 *.log
+
+/media
+
+network.json
