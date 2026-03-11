@@ -199,7 +199,7 @@ async fn play_on_device(
                     format!("Device not found: {}", device_uuid),
                 )
             })?;
-        let uri = format!("{}/media/{}", st.media_server_base_url, body.media_filename);
+        let uri = format!("{}/api/media/stream/{}", st.media_server_base_url, body.media_filename);
         (device.av_transport_url.clone(), uri)
     };
 
@@ -317,12 +317,11 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-c:v", "h264_nvenc",
                 "-preset", "p4",
                 "-tune", "ll",
-                "-rc", "cqp",
-                "-qp", "18",
+                "-rc", "vbr",
+                "-cq", "18",
                 "-bf", "3",
-                "-b:v", "0",
             ],
-            vec!["-c:a", "aac", "-b:a", "192k"],
+            vec!["-c:a", "aac", "-b:a", "256k"],
         ),
         HardwareEncoder::IntelQsv => (
             vec![
@@ -330,9 +329,8 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-preset", "veryfast",
                 "-look_ahead", "0",
                 "-q", "18",
-                "-bitrate", "0",
             ],
-            vec!["-c:a", "aac", "-b:a", "192k"],
+            vec!["-c:a", "aac", "-b:a", "256k"],
         ),
         HardwareEncoder::AmdVce => (
             vec![
@@ -340,7 +338,7 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-preset", "quality",
                 "-qp", "18",
             ],
-            vec!["-c:a", "aac", "-b:a", "192k"],
+            vec!["-c:a", "aac", "-b:a", "256k"],
         ),
         HardwareEncoder::AppleVtb => (
             vec![
@@ -349,7 +347,7 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-quantizer", "18",
                 "-realtime",
             ],
-            vec!["-c:a", "aac", "-b:a", "192k"],
+            vec!["-c:a", "aac", "-b:a", "256k"],
         ),
         HardwareEncoder::VAAPI => (
             vec![
@@ -358,7 +356,7 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-c:v", "h264_vaapi",
                 "-qp", "18",
             ],
-            vec!["-c:a", "aac", "-b:a", "192k"],
+            vec!["-c:a", "aac", "-b:a", "256k"],
         ),
         HardwareEncoder::None => (
             vec![
@@ -366,9 +364,8 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
                 "-crf", "18",
-                "-vf", "scale=-2:720",
             ],
-            vec!["-c:a", "aac", "-b:a", "192k"],
+            vec!["-c:a", "aac", "-b:a", "256k"],
         ),
     }
 }
@@ -389,23 +386,27 @@ async fn stream_media(
     
     let media_path_str = media_path.to_str().unwrap().to_string();
     
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-stream_loop", "-1",
-            "-re",
-            "-i", &media_path_str,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-s", "1920x1080",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-f", "matroska",
-            "-",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let hw_encoder = detect_hardware_encoder();
+    let (video_args, audio_args) = build_encoder_args(&hw_encoder);
+    
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-stream_loop").arg("-1");
+    cmd.arg("-re");
+    cmd.arg("-i").arg(&media_path_str);
+    
+    for arg in video_args {
+        cmd.arg(arg);
+    }
+    for arg in audio_args {
+        cmd.arg(arg);
+    }
+    
+    cmd.arg("-f").arg("mpegts");
+    cmd.arg("-");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    
+    let mut child = cmd.spawn()
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start ffmpeg: {}", e)))?;
     
     let mut stdout = child.stdout.take().ok_or_else(|| 
@@ -435,7 +436,7 @@ async fn stream_media(
     };
     
     Ok((
-        [("Content-Type", "video/x-matroska")],
+        [("Content-Type", "video/mp2t")],
         axum::body::Body::from_stream(stream)
     ))
 }
@@ -570,7 +571,7 @@ async fn apply_scene(
                 continue;
             }
         };
-        let media_uri = format!("{}/media/{}", media_base, filename);
+        let media_uri = format!("{}/api/media/stream/{}", media_base, filename);
         let client = app.client.lock().await;
         match dlna::play_media(&client, &av_url, &media_uri).await {
             Ok(_) => {
