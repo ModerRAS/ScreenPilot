@@ -388,6 +388,57 @@ async fn stream_media(
     }
     
     let media_path_str = media_path.to_str().unwrap().to_string();
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    
+    let is_streamable = matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "avi" | "mov");
+    
+    if is_streamable {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-stream_loop", "-1",
+                "-re",
+                "-i", &media_path_str,
+                "-c:v", "copy",
+                "-c:a", "copy",
+                "-f", "mpegts",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start ffmpeg: {}", e)))?;
+        
+        let mut stdout = child.stdout.take().ok_or_else(|| 
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to capture ffmpeg output"))?;
+        
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
+        
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        
+        let stream = async_stream::stream! {
+            for chunk in rx {
+                yield chunk;
+            }
+        };
+        
+        return Ok((
+            [("Content-Type", "video/mp2t")],
+            axum::body::Body::from_stream(stream)
+        ));
+    }
     
     let hw_encoder = detect_hardware_encoder();
     let (video_args, audio_args) = build_encoder_args(&hw_encoder);
@@ -407,7 +458,7 @@ async fn stream_media(
     cmd.arg("-f").arg("mpegts");
     cmd.arg("-");
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
+    cmd.stderr(Stdio::piped());
     
     let mut child = cmd.spawn()
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start ffmpeg: {}", e)))?;
