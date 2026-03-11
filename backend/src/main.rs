@@ -259,6 +259,31 @@ async fn stop_device(
     Ok(StatusCode::OK)
 }
 
+async fn get_device_loop(
+    State(app): State<WebAppState>,
+    Path(device_uuid): Path<String>,
+) -> Result<Json<bool>, ApiError> {
+    let st = app.shared.read().await;
+    let device = st.devices
+        .iter()
+        .find(|d| d.uuid == device_uuid)
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Device not found"))?;
+    Ok(Json(device.loop_playback))
+}
+
+async fn set_device_loop(
+    State(app): State<WebAppState>,
+    Path(device_uuid): Path<String>,
+    Json(body): Json<SetLoopRequest>,
+) -> Result<StatusCode, ApiError> {
+    let mut st = app.shared.write().await;
+    if let Some(device) = st.devices.iter_mut().find(|d| d.uuid == device_uuid) {
+        device.loop_playback = body.loop_playback;
+        log::info!("Device {} loop set to {}", device_uuid, body.loop_playback);
+    }
+    Ok(StatusCode::OK)
+}
+
 /// GET /api/media — list available media files.
 async fn list_media(State(app): State<WebAppState>) -> Json<Vec<String>> {
     Json(media_server::list_media_files(&app.media_dir))
@@ -465,9 +490,6 @@ async fn spawn_ffmpeg_stream_with_cache(
     
     let mut cmd = Command::new("ffmpeg");
     
-    if loop_playback {
-        cmd.arg("-stream_loop").arg("-1");
-    }
     
     cmd.arg("-re")
        .arg("-i").arg(&media_path_str);
@@ -1179,6 +1201,7 @@ async fn main() {
         .route("/api/devices/:uuid/play", post(play_on_device))
         .route("/api/devices/:uuid/pause", post(pause_device))
         .route("/api/devices/:uuid/stop", post(stop_device))
+        .route("/api/devices/:uuid/loop", get(get_device_loop).put(set_device_loop))
         .route("/api/media", get(list_media))
         .route("/api/media/upload", post(upload_media).layer(DefaultBodyLimit::max(100 * 1024 * 1024 * 1024)))
         .route("/api/media/stream/*path", get(stream_media))
