@@ -502,7 +502,10 @@ async fn spawn_ffmpeg_stream_with_cache(
     }
     
     // Use tee to output to both pipe (for streaming) and file (for caching)
-    cmd.arg("-f")
+    // Add protocol_whitelist to allow pipe protocol
+    cmd.arg("-protocol_whitelist")
+       .arg("pipe,file,crypto,http,https,tcp,tls")
+       .arg("-f")
        .arg("mpegts")
        .arg(&format!("tee:pipe:1|[f=mpegts]{}", cache_path_str));
     
