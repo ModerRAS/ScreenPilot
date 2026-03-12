@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+// Re-export encoder types for use in AppState
+pub use crate::encoder::DetectionResult;
+
 /// Represents a discovered DLNA MediaRenderer device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RendererDevice {
@@ -57,6 +60,8 @@ pub struct AppState {
     pub preferred_encoder: String,
     /// Loop playback for transcoded stream
     pub loop_playback: bool,
+    /// Cached hardware encoder detection result
+    pub detected_encoders: Option<DetectionResult>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -203,6 +208,7 @@ mod tests {
             media_server_base_url: "http://192.168.1.10:8090".to_string(),
             preferred_encoder: "auto".to_string(),
             loop_playback: true,
+            detected_encoders: None,
         };
 
         assert_eq!(state.devices.len(), 1);

@@ -6,6 +6,8 @@ mod state;
 mod persistence;
 pub mod encoder;
 
+use crate::encoder::{detect_hw_encoders, DetectionResult};
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -88,6 +90,7 @@ pub struct WebAppState {
     pub shared: SharedState,
     pub client: Arc<Mutex<Client>>,
     pub media_dir: PathBuf,
+    pub cached_encoders: Arc<Mutex<Option<DetectionResult>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1105,6 +1108,31 @@ async fn set_encoder(
     Ok(StatusCode::OK)
 }
 
+/// GET /api/config/encoders — get cached encoder detection result.
+async fn get_encoders(State(app): State<WebAppState>) -> Json<Option<DetectionResult>> {
+    let cached = app.cached_encoders.lock().await;
+    Json(cached.clone())
+}
+
+/// GET /api/config/encoders/detect — trigger fresh encoder detection.
+async fn detect_encoders(State(app): State<WebAppState>) -> Json<DetectionResult> {
+    match detect_hw_encoders().await {
+        Ok(result) => {
+            let mut cached = app.cached_encoders.lock().await;
+            *cached = Some(result.clone());
+            Json(result)
+        }
+        Err(_e) => {
+            Json(DetectionResult {
+                encoders: vec![],
+                primary: None,
+                detection_time_ms: 0,
+                sources: vec![],
+            })
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct SetEncoderRequest {
     encoder: String,
@@ -1225,6 +1253,7 @@ async fn main() {
         shared,
         client: Arc::new(Mutex::new(Client::new())),
         media_dir: media_dir.clone(),
+        cached_encoders: Arc::new(Mutex::new(None)),
     };
 
     // CORS — allow the Vue dev server and any other origin
@@ -1248,6 +1277,8 @@ async fn main() {
         .route("/api/scenes/:name/apply", post(apply_scene))
         .route("/api/config/media-server-url", get(get_media_server_url))
         .route("/api/config/encoder", get(get_encoder).put(set_encoder))
+        .route("/api/config/encoders", get(get_encoders))
+        .route("/api/config/encoders/detect", get(detect_encoders))
         .route("/api/config/loop-playback", get(get_loop_playback).put(set_loop_playback))
         .nest_service("/media", ServeDir::new(media_dir.clone()))
         .route("/web/assets/*path", get(serve_assets))
