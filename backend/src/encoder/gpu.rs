@@ -335,20 +335,22 @@ fn detect_amd() -> Option<Vec<HwEncoder>> {
 fn check_amd_windows() -> bool {
     use std::process::Command;
 
-    let output = Command::new("reg")
-        .args([
-            "query",
-            r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
-            "/v",
-            "DriverDesc",
-        ])
+    // Use PowerShell to enumerate all subkeys and check DriverDesc
+    let ps_script = r#"
+        $gpuKeys = Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue
+        foreach ($key in $gpuKeys) {
+            $desc = (Get-ItemProperty $key.PSPath -Name DriverDesc -ErrorAction SilentlyContinue).DriverDesc
+            if ($desc -match 'AMD|Radeon') { exit 0 }
+        }
+        exit 1
+    "#;
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps_script])
         .output();
 
     match output {
-        Ok(result) => {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            stdout.contains("AMD") || stdout.contains("Radeon")
-        }
+        Ok(result) => result.status.success(),
         Err(_) => false,
     }
 }
