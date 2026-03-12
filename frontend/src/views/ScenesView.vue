@@ -79,70 +79,163 @@ async function apply(name: string) {
 </script>
 
 <template>
-  <div>
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px">
+  <div class="scenes-view">
+    <div class="header-row">
       <h2 style="margin: 0">Scenes</h2>
-      <el-button type="primary" @click="showEditor()">＋ New Scene</el-button>
+      <el-button type="primary" size="large" class="touch-target" @click="showEditor()">＋ New</el-button>
     </div>
 
     <el-empty v-if="store.scenes.length === 0 && !editorVisible" description="No scenes defined yet. Create a scene to control multiple screens at once." />
 
-    <el-row :gutter="16">
+    <el-row :gutter="12">
       <el-col v-for="scene in store.scenes" :key="scene.name" :xs="24" :sm="12" :md="8">
-        <el-card shadow="hover" style="margin-bottom: 16px">
+        <el-card shadow="hover" class="scene-card">
           <template #header>
             <strong>🎬 {{ scene.name }}</strong>
           </template>
 
-          <div v-for="(file, uuid) in scene.assignments" :key="uuid" style="font-size: 13px; margin-bottom: 4px; color: var(--el-text-color-secondary)">
+          <div v-for="(file, uuid) in scene.assignments" :key="uuid" class="scene-assignment">
             <strong>{{ deviceName(uuid) }}</strong> → {{ file }}
           </div>
 
           <template #footer>
-            <div style="display: flex; gap: 8px">
-              <el-button type="primary" size="small" @click="apply(scene.name)">▶ Apply</el-button>
-              <el-button size="small" @click="showEditor(scene)">✏ Edit</el-button>
-              <el-button type="danger" size="small" @click="remove(scene.name)">🗑 Delete</el-button>
+            <div class="scene-actions">
+              <el-button type="primary" size="large" class="touch-target" @click="apply(scene.name)">▶</el-button>
+              <el-button size="large" class="touch-target" @click="showEditor(scene)">✏</el-button>
+              <el-button type="danger" size="large" class="touch-target" @click="remove(scene.name)">🗑</el-button>
             </div>
           </template>
         </el-card>
       </el-col>
     </el-row>
 
-    <!-- Scene Editor Dialog -->
-    <el-dialog v-model="editorVisible" :title="editingName ? `Edit Scene: ${editingName}` : 'New Scene'" width="500px">
-      <el-form label-width="100px">
-        <el-form-item label="Scene Name">
-          <el-input v-model="sceneName" placeholder="e.g. Morning" />
-        </el-form-item>
+    <el-dialog 
+      v-model="editorVisible" 
+      :title="editingName ? `Edit Scene: ${editingName}` : 'New Scene'" 
+      :fullscreen="true"
+      class="scene-dialog"
+    >
+      <div class="dialog-content">
+        <el-form label-position="top">
+          <el-form-item label="Scene Name">
+            <el-input v-model="sceneName" placeholder="e.g. Morning" size="large" />
+          </el-form-item>
 
-        <el-divider>Device Assignments</el-divider>
+          <el-divider>Device Assignments</el-divider>
 
-        <div v-if="store.devices.length === 0" style="text-align: center; color: var(--el-text-color-secondary); padding: 12px 0">
-          No devices discovered yet. Run discovery first.
-        </div>
+          <div v-if="store.devices.length === 0" style="text-align: center; color: var(--el-text-color-secondary); padding: 24px 0">
+            No devices discovered yet. Run discovery first.
+          </div>
 
-        <el-form-item v-for="device in store.devices" :key="device.uuid" :label="device.name">
-          <el-select
-            v-model="sceneAssignments[device.uuid]"
-            placeholder="— none —"
-            clearable
-            style="width: 100%"
-          >
-            <el-option
-              v-for="file in store.mediaFiles"
-              :key="file"
-              :label="file"
-              :value="file"
-            />
-          </el-select>
-        </el-form-item>
-      </el-form>
+          <el-form-item v-for="device in store.devices" :key="device.uuid" :label="device.name">
+            <el-select
+              v-model="sceneAssignments[device.uuid]"
+              placeholder="— none —"
+              clearable
+              size="large"
+              style="width: 100%"
+            >
+              <el-option
+                v-for="file in store.mediaFiles"
+                :key="file"
+                :label="file"
+                :value="file"
+              />
+            </el-select>
+          </el-form-item>
+        </el-form>
+      </div>
 
       <template #footer>
-        <el-button @click="hideEditor()">Cancel</el-button>
-        <el-button type="primary" @click="save()">Save Scene</el-button>
+        <div class="dialog-footer">
+          <el-button size="large" class="touch-target" @click="hideEditor()">Cancel</el-button>
+          <el-button type="primary" size="large" class="touch-target" @click="save()">Save Scene</el-button>
+        </div>
       </template>
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.scenes-view {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.scene-card {
+  height: 100%;
+}
+
+.scene-assignment {
+  font-size: 13px;
+  margin-bottom: 4px;
+  color: var(--el-text-color-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scene-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.scene-actions .el-button {
+  flex: 1;
+}
+
+.touch-target {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+.dialog-content {
+  padding: 16px;
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+.dialog-footer {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.dialog-footer .el-button {
+  flex: 1;
+}
+
+@media (min-width: 768px) {
+  .el-dialog {
+    width: 500px !important;
+    max-width: 90vw;
+  }
+  
+  .el-dialog.is-fullscreen {
+    width: 100% !important;
+    max-width: 600px;
+  }
+  
+  .dialog-content {
+    padding: 0;
+  }
+  
+  .dialog-footer {
+    flex-direction: row;
+  }
+  
+  .dialog-footer .el-button {
+    flex: none;
+    min-width: 100px;
+  }
+}
+</style>

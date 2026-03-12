@@ -102,11 +102,14 @@ async function toggleLoop(uuid: string, loop: boolean) {
 </script>
 
 <template>
-  <div>
-    <!-- Encoder selection -->
-    <div style="margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
-      <span>Encoder:</span>
-      <el-select v-model="store.encoder" @change="handleEncoderChange">
+  <div class="devices-view">
+    <div class="controls-row">
+      <el-select 
+        v-model="store.encoder" 
+        @change="handleEncoderChange"
+        class="encoder-select"
+        placeholder="Encoder"
+      >
         <el-option label="Auto (Hardware)" value="auto" />
         <el-option label="NVIDIA" value="nvidia" />
         <el-option label="AMD" value="amd" />
@@ -114,9 +117,7 @@ async function toggleLoop(uuid: string, loop: boolean) {
         <el-option label="Apple" value="apple" />
         <el-option label="Software (CPU)" value="software" />
       </el-select>
-    </div>
 
-    <div style="margin-bottom: 16px">
       <input
         ref="fileInput"
         type="file"
@@ -124,21 +125,26 @@ async function toggleLoop(uuid: string, loop: boolean) {
         style="display: none"
         @change="handleFileChange"
       >
-      <el-button type="primary" :loading="uploading" @click="triggerUpload">
-        {{ uploading ? 'Uploading...' : 'Upload Video' }}
+      <el-button 
+        type="primary" 
+        :loading="uploading" 
+        class="upload-btn touch-target"
+        @click="triggerUpload"
+      >
+        {{ uploading ? 'Uploading...' : '📤 Upload' }}
       </el-button>
     </div>
 
     <el-empty v-if="store.devices.length === 0" description="No devices found. Click Discover Devices to scan the network." />
 
-    <el-row :gutter="16">
+    <el-row :gutter="12">
       <el-col v-for="device in store.devices" :key="device.uuid" :xs="24" :sm="12" :md="8" :lg="6">
-        <el-card shadow="hover" style="margin-bottom: 16px">
+        <el-card shadow="hover" class="device-card">
           <template #header>
-            <div style="display: flex; justify-content: space-between; align-items: center">
-              <div>
-                <strong>{{ device.name }}</strong>
-                <div style="font-size: 12px; color: var(--el-text-color-secondary)">{{ device.ip }}</div>
+            <div class="device-header">
+              <div class="device-info">
+                <strong class="device-name">{{ device.name }}</strong>
+                <div class="device-ip">{{ device.ip }}</div>
               </div>
               <el-tag :type="statusType(device.status)" size="small">
                 {{ device.status.toUpperCase() }}
@@ -146,16 +152,16 @@ async function toggleLoop(uuid: string, loop: boolean) {
             </div>
           </template>
 
-          <div v-if="device.current_media" style="margin-bottom: 12px; font-size: 13px; color: var(--el-text-color-secondary)">
+          <div v-if="device.current_media" class="now-playing">
             Now playing: <strong>{{ device.current_media }}</strong>
           </div>
 
-          <div style="display: flex; gap: 8px; margin-bottom: 12px">
+          <div class="media-select-row">
             <el-select
               v-model="selectedMedia[device.uuid]"
               placeholder="Select media"
-              style="flex: 1"
-              size="small"
+              class="media-select"
+              size="large"
             >
               <el-option
                 v-for="file in store.mediaFiles"
@@ -164,24 +170,26 @@ async function toggleLoop(uuid: string, loop: boolean) {
                 :value="file"
               />
             </el-select>
-            <el-button type="primary" size="small" @click="play(device.uuid)">▶ Play</el-button>
+            <el-button type="primary" size="large" class="play-btn touch-target" @click="play(device.uuid)">▶</el-button>
           </div>
 
-          <div style="display: flex; gap: 8px">
+          <div class="control-row">
             <el-button
-              size="small"
+              size="large"
+              class="control-btn touch-target"
               :disabled="device.status !== 'playing'"
               @click="pause(device.uuid)"
-            >⏸ Pause</el-button>
+            >⏸</el-button>
             <el-button
-              size="small"
+              size="large"
+              class="control-btn touch-target"
               :disabled="device.status === 'idle' || device.status === 'stopped'"
               @click="stop(device.uuid)"
-            >⏹ Stop</el-button>
+            >⏹</el-button>
             <el-switch
               v-model="device.loop_playback"
-              size="small"
-              active-text="Loop"
+              size="large"
+              active-text="🔁"
               @change="(val: boolean) => toggleLoop(device.uuid, val)"
             />
           </div>
@@ -190,3 +198,124 @@ async function toggleLoop(uuid: string, loop: boolean) {
     </el-row>
   </div>
 </template>
+
+<style scoped>
+.devices-view {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.controls-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.encoder-select {
+  flex: 1;
+  min-width: 140px;
+}
+
+.upload-btn {
+  flex: 1;
+  min-width: 140px;
+}
+
+.device-card {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.device-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.device-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.device-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-ip {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.now-playing {
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-select-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.media-select {
+  flex: 1;
+}
+
+.play-btn {
+  min-width: 56px;
+}
+
+.control-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.control-btn {
+  flex: 1;
+  min-width: 56px;
+}
+
+.touch-target {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+@media (max-width: 767px) {
+  .controls-row {
+    flex-direction: column;
+  }
+  
+  .encoder-select,
+  .upload-btn {
+    width: 100%;
+  }
+  
+  .media-select-row {
+    flex-direction: column;
+  }
+  
+  .play-btn {
+    width: 100%;
+  }
+  
+  .control-row {
+    flex-direction: column;
+  }
+  
+  .control-btn {
+    width: 100%;
+  }
+}
+</style>
