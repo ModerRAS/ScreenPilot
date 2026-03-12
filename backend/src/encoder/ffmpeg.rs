@@ -150,19 +150,14 @@ fn map_ffmpeg_encoder(info: &FfmpegEncoderInfo) -> Option<HwEncoder> {
 
 /// Parse FFmpeg encoder output to extract hardware encoder info.
 ///
-/// The output format looks like:
-/// ...
-///  h264_nvenc           NVIDIA NVENC H.264 encoder [NVIDIA GeForce RTX 3080]
-/// ...
+/// Output format: "V....D h264_vaapi   H.264/AVC (VAAPI)"
 fn parse_encoder_line(line: &str) -> Option<FfmpegEncoderInfo> {
     let line = line.trim();
 
-    // Skip empty lines and section headers
     if line.is_empty() || line.starts_with("Encoders") || line.starts_with("----") {
         return None;
     }
 
-    // Hardware encoders we're looking for
     let hw_encoders = [
         "h264_nvenc",
         "hevc_nvenc",
@@ -181,21 +176,26 @@ fn parse_encoder_line(line: &str) -> Option<FfmpegEncoderInfo> {
         "av1_vaapi",
     ];
 
-    // Find which encoder this line is for
-    for encoder_name in hw_encoders {
-        if line.starts_with(encoder_name) {
-            // Extract codec from encoder name (e.g., "h264_nvenc" -> "h264")
-            let codec_name = encoder_name.split('_').next().unwrap_or(encoder_name);
-
-            return Some(FfmpegEncoderInfo {
-                ffmpeg_name: encoder_name.to_string(),
-                codec_name: codec_name.to_string(),
-                is_hardware: true,
-            });
-        }
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
     }
 
-    None
+    let encoder_token = if hw_encoders.contains(&parts[0]) {
+        parts[0]
+    } else if parts.len() >= 2 && hw_encoders.contains(&parts[1]) {
+        parts[1]
+    } else {
+        return None;
+    };
+
+    let codec_name = encoder_token.split('_').next().unwrap_or(encoder_token);
+
+    Some(FfmpegEncoderInfo {
+        ffmpeg_name: encoder_token.to_string(),
+        codec_name: codec_name.to_string(),
+        is_hardware: true,
+    })
 }
 
 /// Probe FFmpeg for available hardware encoders.
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_parse_encoder_line_nvenc() {
-        let line = "  h264_nvenc           NVIDIA NVENC H.264 encoder [NVIDIA GeForce RTX 3080]";
+        let line = " V....D h264_nvenc           NVIDIA NVENC H.264 encoder [NVIDIA GeForce RTX 3080]";
         let info = parse_encoder_line(line).unwrap();
         assert_eq!(info.ffmpeg_name, "h264_nvenc");
         assert_eq!(info.codec_name, "h264");
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_parse_encoder_line_qsv() {
-        let line = "  hevc_qsv             Intel Quick Sync Video HEVC encoder [Intel Iris Xe]";
+        let line = " V..... hevc_qsv             Intel Quick Sync Video HEVC encoder [Intel Iris Xe]";
         let info = parse_encoder_line(line).unwrap();
         assert_eq!(info.ffmpeg_name, "hevc_qsv");
         assert_eq!(info.codec_name, "hevc");
@@ -267,22 +267,21 @@ mod tests {
 
     #[test]
     fn test_parse_encoder_line_videotoolbox() {
-        let line = "  h264_videotoolbox    Apple VideoToolbox H.264 encoder";
+        let line = " V....D h264_videotoolbox    Apple VideoToolbox H.264 encoder";
         let info = parse_encoder_line(line).unwrap();
         assert_eq!(info.ffmpeg_name, "h264_videotoolbox");
     }
 
     #[test]
     fn test_parse_encoder_line_vaapi() {
-        let line = "  hevc_vaapi           VAAPI HEVC encoder";
+        let line = " V....D hevc_vaapi           VAAPI HEVC encoder";
         let info = parse_encoder_line(line).unwrap();
         assert_eq!(info.ffmpeg_name, "hevc_vaapi");
     }
 
     #[test]
     fn test_parse_encoder_line_software() {
-        // Software encoders should not be detected
-        let line = "  libx264              libx264 H.264 encoder";
+        let line = " V....D libx264              libx264 H.264 encoder";
         let info = parse_encoder_line(line);
         assert!(info.is_none());
     }
