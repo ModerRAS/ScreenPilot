@@ -142,7 +142,6 @@ mod tests {
 
     #[test]
     fn test_save_devices_invalid_path() {
-        // Test with a path that cannot be created (empty parent)
         let test_devices = vec![RendererDevice {
             uuid: "test".to_string(),
             name: "Test".to_string(),
@@ -150,6 +149,7 @@ mod tests {
             av_transport_url: "http://192.168.1.1:8000".to_string(),
             status: crate::state::PlaybackStatus::Idle,
             current_media: None,
+            loop_playback: false,
         }];
 
         // This should still work because we use current_exe fallback

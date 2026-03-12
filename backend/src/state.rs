@@ -78,6 +78,7 @@ mod tests {
             av_transport_url: "http://192.168.1.100:49152/upnp/control/AVTransport".to_string(),
             status: PlaybackStatus::Idle,
             current_media: None,
+            loop_playback: false,
         };
         assert_eq!(device.uuid, "test-uuid-123");
         assert_eq!(device.name, "Living Room TV");
@@ -94,6 +95,7 @@ mod tests {
             av_transport_url: "http://192.168.1.1:8008/ctrl".to_string(),
             status: PlaybackStatus::Playing,
             current_media: Some("ad.mp4".to_string()),
+            loop_playback: false,
         };
         let device2 = device1.clone();
         assert_eq!(device1.uuid, device2.uuid);
@@ -185,6 +187,7 @@ mod tests {
             av_transport_url: "http://192.168.1.1:8000".to_string(),
             status: PlaybackStatus::Idle,
             current_media: None,
+            loop_playback: false,
         };
 
         let mut assignments = HashMap::new();
@@ -198,6 +201,8 @@ mod tests {
             devices: vec![device],
             scenes: vec![scene],
             media_server_base_url: "http://192.168.1.10:8090".to_string(),
+            preferred_encoder: "auto".to_string(),
+            loop_playback: true,
         };
 
         assert_eq!(state.devices.len(), 1);

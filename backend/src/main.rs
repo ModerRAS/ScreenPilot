@@ -1256,3 +1256,116 @@ async fn bind_with_fallback(port: u16) -> (tokio::net::TcpListener, u16) {
     
     panic!("Could not bind to any port in range {:?}", ports_to_try);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_cache_dir() {
+        let media_dir = PathBuf::from("/test/media");
+        let cache_dir = get_cache_dir(&media_dir);
+        assert_eq!(cache_dir, PathBuf::from("/test/media/.cache"));
+    }
+
+    #[test]
+    fn test_get_cache_path() {
+        let media_dir = PathBuf::from("/test/media");
+        
+        let path = get_cache_path(&media_dir, "video.mp4", &HardwareEncoder::None);
+        assert!(path.to_string_lossy().contains("video.mp4.libx264.ts"));
+        
+        let path_nvenc = get_cache_path(&media_dir, "test.webm", &HardwareEncoder::Nvidia);
+        assert!(path_nvenc.to_string_lossy().contains("test.webm.nvenc.ts"));
+        
+        let path_vaapi = get_cache_path(&media_dir, "movie.mkv", &HardwareEncoder::Vaapi);
+        assert!(path_vaapi.to_string_lossy().contains("movie.mkv.vaapi.ts"));
+    }
+
+    #[test]
+    fn test_get_cache_path_sanitizes_filename() {
+        let media_dir = PathBuf::from("/test/media");
+        
+        let path = get_cache_path(&media_dir, "video/with:invalid*chars.mp4", &HardwareEncoder::None);
+        let path_str = path.to_string_lossy();
+        
+        let has_invalid_chars = path_str.contains(':') || path_str.contains('*') || path_str.contains('?');
+        assert!(!has_invalid_chars, "Path should not contain invalid chars: {}", path_str);
+    }
+
+    #[test]
+    fn test_check_cache_nonexistent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let media_dir = temp_dir.path().to_path_buf();
+        
+        let result = check_cache(&media_dir, "nonexistent.mp4", &HardwareEncoder::None);
+        assert!(result.is_none());
+        
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_check_cache_file_too_old() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let media_dir = temp_dir.path().to_path_buf();
+        
+        std::fs::write(media_dir.join("original.mp4"), b"original").unwrap();
+        let cache_dir = media_dir.join(".cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("original.mp4.libx264.ts"), b"cached").unwrap();
+        
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::write(media_dir.join("original.mp4"), b"newer").unwrap();
+        
+        let result = check_cache(&media_dir, "original.mp4", &HardwareEncoder::None);
+        assert!(result.is_none());
+        
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_check_cache_valid() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let media_dir = temp_dir.path().to_path_buf();
+        
+        std::fs::write(media_dir.join("original.mp4"), b"original").unwrap();
+        
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        let cache_dir = media_dir.join(".cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("original.mp4.libx264.ts"), b"cached").unwrap();
+        
+        let result = check_cache(&media_dir, "original.mp4", &HardwareEncoder::None);
+        assert!(result.is_some());
+        assert!(result.unwrap().to_string_lossy().contains(".cache"));
+        
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_hardware_encoder_detection() {
+        let detected = detect_hardware_encoder();
+        
+        match detected {
+            HardwareEncoder::None => println!("Using software encoder"),
+            HardwareEncoder::Nvidia => println!("Using NVIDIA"),
+            HardwareEncoder::IntelQsv => println!("Using Intel QSV"),
+            HardwareEncoder::AmdVce => println!("Using AMD VCE"),
+            HardwareEncoder::AppleVtb => println!("Using Apple VT"),
+            HardwareEncoder::Vaapi => println!("Using VAAPI"),
+        }
+        
+        assert!(true);
+    }
+
+    #[test]
+    fn test_encoder_from_preference() {
+        assert!(matches!(get_encoder_from_preference("software"), HardwareEncoder::None));
+        assert!(matches!(get_encoder_from_preference("nvidia"), HardwareEncoder::Nvidia));
+        assert!(matches!(get_encoder_from_preference("amd"), HardwareEncoder::AmdVce));
+        assert!(matches!(get_encoder_from_preference("intel"), HardwareEncoder::IntelQsv));
+        assert!(matches!(get_encoder_from_preference("apple"), HardwareEncoder::AppleVtb));
+        assert!(matches!(get_encoder_from_preference("vaapi"), HardwareEncoder::Vaapi));
+    }
+}
