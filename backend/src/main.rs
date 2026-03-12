@@ -4,6 +4,7 @@ mod frontend;
 mod media_server;
 mod state;
 mod persistence;
+pub mod encoder;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -480,7 +481,7 @@ async fn spawn_ffmpeg_stream_with_cache(
     let media_path_str = media_path.to_str().unwrap().to_string();
     let cache_path = get_cache_path(media_dir, filename, encoder);
     let cache_dir = get_cache_dir(media_dir);
-    let cache_path_str = cache_path.to_str().unwrap().to_string();
+    let _cache_path_str = cache_path.to_str().unwrap().to_string();
     
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Failed to create cache dir: {}", e))?;
     
@@ -501,13 +502,8 @@ async fn spawn_ffmpeg_stream_with_cache(
         cmd.arg(arg);
     }
     
-    // Use tee to output to both pipe (for streaming) and file (for caching)
-    // Add protocol_whitelist to allow pipe protocol
-    cmd.arg("-protocol_whitelist")
-       .arg("pipe,file,crypto,http,https,tcp,tls")
-       .arg("-f")
-       .arg("mpegts")
-       .arg(&format!("tee:pipe:1|[f=mpegts]{}", cache_path_str));
+    // Use simple streaming without tee (Debian ffmpeg has pipe protocol disabled by default)
+    cmd.arg("-f").arg("mpegts").arg("-");
     
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -519,6 +515,45 @@ async fn spawn_ffmpeg_stream_with_cache(
         "Failed to capture ffmpeg output".to_string())?;
 
     let mut ffmpeg = FfmpegProcess { child };
+    
+    // Spawn background process to create cache file (runs independently)
+    let media_path_clone = media_path_str.clone();
+    let cache_path_clone = cache_path.clone();
+    let encoder_clone = encoder.clone();
+    std::thread::spawn(move || {
+        let cache_path_str = cache_path_clone.to_str().unwrap().to_string();
+        if cache_path_clone.exists() {
+            log::info!("Cache already exists, skipping background transcode");
+            return;
+        }
+        log::info!("Starting background transcode to cache: {}", cache_path_str);
+        
+        let (video_args, audio_args) = build_encoder_args(&encoder_clone);
+        
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.arg("-y")
+           .arg("-stream_loop").arg("-1")
+           .arg("-re")
+           .arg("-i").arg(&media_path_clone);
+        
+        for arg in video_args {
+            cmd.arg(arg);
+        }
+        for arg in audio_args {
+            cmd.arg(arg);
+        }
+        
+        cmd.arg("-f").arg("mpegts")
+           .arg(&cache_path_str);
+        
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        
+        if let Ok(mut child) = cmd.spawn() {
+            let _ = child.wait();
+            log::info!("Background transcode completed: {}", cache_path_str);
+        }
+    });
     
     let encoder_for_check = encoder.clone();
     let stderr_thread = std::thread::spawn(move || {
