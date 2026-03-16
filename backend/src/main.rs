@@ -389,7 +389,6 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-c:v", "h264_amf",
                 "-preset", "quality",
                 "-qp", "18",
-                "-profile:v", "baseline",
             ],
             vec!["-c:a", "aac", "-b:a", "128k"],
         ),
