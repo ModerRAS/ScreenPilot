@@ -370,7 +370,6 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-rc", "constqp",
                 "-qp", "18",
                 "-bf", "0",
-                "-profile:v", "baseline",
                 "-level", "4.0",
             ],
             vec!["-c:a", "aac", "-b:a", "128k"],
@@ -380,7 +379,6 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-c:v", "h264_qsv",
                 "-preset", "veryfast",
                 "-global_quality", "18",
-                "-profile:v", "baseline",
             ],
             vec!["-c:a", "aac", "-b:a", "128k"],
         ),
@@ -395,7 +393,6 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
         HardwareEncoder::AppleVtb => (
             vec![
                 "-c:v", "h264_videotoolbox",
-                "-profile:v", "baseline",
                 "-q", "18",
             ],
             vec!["-c:a", "aac", "-b:a", "128k"],
@@ -406,7 +403,6 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-vf", "format=nv12,hwupload",
                 "-c:v", "h264_vaapi",
                 "-qp", "18",
-                "-profile:v", "baseline",
             ],
             vec!["-c:a", "aac", "-b:a", "128k"],
         ),
