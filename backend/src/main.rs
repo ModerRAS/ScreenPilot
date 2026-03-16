@@ -535,7 +535,6 @@ async fn spawn_ffmpeg_stream_with_cache(
         
         let mut cmd = std::process::Command::new("ffmpeg");
         cmd.arg("-y")
-           .arg("-stream_loop").arg("-1")
            .arg("-re")
            .arg("-i").arg(&media_path_clone);
         
@@ -635,7 +634,6 @@ async fn transcode_to_cache(
     
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.arg("-y")
-       .arg("-stream_loop").arg("-1")
        .arg("-re")
        .arg("-i").arg(&media_path_str);
     
@@ -688,7 +686,8 @@ fn serve_cached_file(cache_path: &PathBuf) -> impl axum::response::IntoResponse 
     let cache_path_str = cache_path.to_str().unwrap().to_string();
     
     let mut cmd = std::process::Command::new("ffmpeg");
-    cmd.arg("-re")
+    cmd.arg("-stream_loop").arg("-1")
+       .arg("-re")
        .arg("-i").arg(&cache_path_str)
        .arg("-c").arg("copy")
        .arg("-f").arg("mpegts")
