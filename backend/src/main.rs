@@ -369,33 +369,37 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-tune", "ll",
                 "-rc", "constqp",
                 "-qp", "18",
-                "-bf", "3",
+                "-bf", "0",
+                "-profile:v", "baseline",
+                "-level", "4.0",
             ],
-            vec!["-c:a", "aac", "-b:a", "256k"],
+            vec!["-c:a", "aac", "-b:a", "128k"],
         ),
         HardwareEncoder::IntelQsv => (
             vec![
                 "-c:v", "h264_qsv",
                 "-preset", "veryfast",
                 "-global_quality", "18",
+                "-profile:v", "baseline",
             ],
-            vec!["-c:a", "aac", "-b:a", "256k"],
+            vec!["-c:a", "aac", "-b:a", "128k"],
         ),
         HardwareEncoder::AmdVce => (
             vec![
                 "-c:v", "h264_amf",
                 "-preset", "quality",
                 "-qp", "18",
+                "-profile:v", "baseline",
             ],
-            vec!["-c:a", "aac", "-b:a", "256k"],
+            vec!["-c:a", "aac", "-b:a", "128k"],
         ),
         HardwareEncoder::AppleVtb => (
             vec![
                 "-c:v", "h264_videotoolbox",
-                "-profile:v", "high",
+                "-profile:v", "baseline",
                 "-q", "18",
             ],
-            vec!["-c:a", "aac", "-b:a", "256k"],
+            vec!["-c:a", "aac", "-b:a", "128k"],
         ),
         HardwareEncoder::Vaapi => (
             vec![
@@ -403,8 +407,9 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-vf", "format=nv12,hwupload",
                 "-c:v", "h264_vaapi",
                 "-qp", "18",
+                "-profile:v", "baseline",
             ],
-            vec!["-c:a", "aac", "-b:a", "256k"],
+            vec!["-c:a", "aac", "-b:a", "128k"],
         ),
         HardwareEncoder::None => (
             vec![
@@ -412,8 +417,10 @@ fn build_encoder_args(hw: &HardwareEncoder) -> (Vec<&'static str>, Vec<&'static 
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
                 "-crf", "18",
+                "-profile:v", "baseline",
+                "-level", "4.0",
             ],
-            vec!["-c:a", "aac", "-b:a", "256k"],
+            vec!["-c:a", "aac", "-b:a", "128k"],
         ),
     }
 }
@@ -494,6 +501,9 @@ async fn spawn_ffmpeg_stream_with_cache(
     
     let mut cmd = Command::new("ffmpeg");
     
+    if loop_playback {
+        cmd.arg("-stream_loop").arg("-1");
+    }
     
     cmd.arg("-re")
        .arg("-i").arg(&media_path_str);
