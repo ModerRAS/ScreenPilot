@@ -469,6 +469,80 @@ fn check_cache(media_dir: &PathBuf, filename: &str, encoder: &HardwareEncoder) -
     None
 }
 
+#[derive(Debug, Clone)]
+struct MediaInfo {
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    video_width: Option<u32>,
+    video_height: Option<u32>,
+}
+
+fn probe_media_info(media_path: &PathBuf) -> Option<MediaInfo> {
+    let output = std::process::Command::new("ffprobe")
+        .arg("-v")
+        .arg("quiet")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-show_format")
+        .arg("-show_streams")
+        .arg(media_path.as_os_str())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+
+    let mut info = MediaInfo {
+        video_codec: None,
+        audio_codec: None,
+        video_width: None,
+        video_height: None,
+    };
+
+    if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+        for stream in streams {
+            let codec_type = stream.get("codec_type").and_then(|v| v.as_str());
+            match codec_type {
+                Some("video") => {
+                    info.video_codec = stream.get("codec_name").and_then(|v| v.as_str()).map(String::from);
+                    info.video_width = stream.get("width").and_then(|v| v.as_u64()).map(|w| w as u32);
+                    info.video_height = stream.get("height").and_then(|v| v.as_u64()).map(|h| h as u32);
+                }
+                Some("audio") => {
+                    info.audio_codec = stream.get("codec_name").and_then(|v| v.as_str()).map(String::from);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Some(info)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TranscodeMode {
+    Copy,        // Both compatible - just re-mux
+    VideoOnly,   // Only video needs encoding
+    AudioOnly,   // Only audio needs encoding
+    Both,        // Both need encoding
+}
+
+fn determine_transcode_mode(media_info: &MediaInfo) -> TranscodeMode {
+    let video_ok = media_info.video_codec.as_deref() == Some("h264");
+    let audio_ok = media_info.audio_codec.as_deref() == Some("aac");
+
+    match (video_ok, audio_ok) {
+        (true, true) => TranscodeMode::Copy,
+        (false, true) => TranscodeMode::VideoOnly,
+        (true, false) => TranscodeMode::AudioOnly,
+        (false, false) => TranscodeMode::Both,
+    }
+}
+
 async fn spawn_ffmpeg_stream_with_cache(
     media_dir: &PathBuf,
     filename: &str,
@@ -490,9 +564,24 @@ async fn spawn_ffmpeg_stream_with_cache(
     
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Failed to create cache dir: {}", e))?;
     
-    let (video_args, audio_args) = build_encoder_args(encoder);
+    let media_info = probe_media_info(&media_path);
+    let transcode_mode = media_info.as_ref().map(determine_transcode_mode).unwrap_or(TranscodeMode::Both);
     
-    log::info!("Starting stream with encoder: {:?}, loop: {}, cache: {:?}", encoder, loop_playback, cache_path.display());
+    log::info!("Media info: {:?}, transcode mode: {:?}", media_info, transcode_mode);
+    
+    let (video_args, audio_args) = match transcode_mode {
+        TranscodeMode::Copy => (vec!["-c:v", "copy"], vec!["-c:a", "copy"]),
+        TranscodeMode::VideoOnly => {
+            let (v, _a) = build_encoder_args(encoder);
+            (v, vec!["-c:a", "copy"])
+        }
+        TranscodeMode::AudioOnly => {
+            (vec!["-c:v", "copy"], build_encoder_args(encoder).1)
+        }
+        TranscodeMode::Both => build_encoder_args(encoder),
+    };
+    
+    log::info!("Starting stream with encoder: {:?}, loop: {}, cache: {:?}, mode: {:?}", encoder, loop_playback, cache_path.display(), transcode_mode);
     
     let mut cmd = Command::new("ffmpeg");
     
@@ -525,9 +614,10 @@ async fn spawn_ffmpeg_stream_with_cache(
     let mut ffmpeg = FfmpegProcess { child };
     
     // Spawn background process to create cache file (runs independently)
-    let media_path_clone = media_path_str.clone();
+    let media_path_clone = media_path.clone();
     let cache_path_clone = cache_path.clone();
     let encoder_clone = encoder.clone();
+    let media_info_clone = media_info.clone();
     std::thread::spawn(move || {
         let cache_path_str = cache_path_clone.to_str().unwrap().to_string();
         if cache_path_clone.exists() {
@@ -536,12 +626,24 @@ async fn spawn_ffmpeg_stream_with_cache(
         }
         log::info!("Starting background transcode to cache: {}", cache_path_str);
         
-        let (video_args, audio_args) = build_encoder_args(&encoder_clone);
+        let transcode_mode = media_info_clone.as_ref().map(determine_transcode_mode).unwrap_or(TranscodeMode::Both);
+        
+        let (video_args, audio_args) = match transcode_mode {
+            TranscodeMode::Copy => (vec!["-c:v", "copy"], vec!["-c:a", "copy"]),
+            TranscodeMode::VideoOnly => {
+                let (v, _a) = build_encoder_args(&encoder_clone);
+                (v, vec!["-c:a", "copy"])
+            }
+            TranscodeMode::AudioOnly => {
+                (vec!["-c:v", "copy"], build_encoder_args(&encoder_clone).1)
+            }
+            TranscodeMode::Both => build_encoder_args(&encoder_clone),
+        };
         
         let mut cmd = std::process::Command::new("ffmpeg");
         cmd.arg("-y")
            .arg("-re")
-           .arg("-i").arg(&media_path_clone);
+           .arg("-i").arg(media_path_clone.to_str().unwrap());
         
         for arg in video_args {
             cmd.arg(arg);
