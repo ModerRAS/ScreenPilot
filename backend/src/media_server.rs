@@ -7,14 +7,78 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 /// Pick the first non-loopback IPv4 address of the host.
+///
+/// Tries multiple methods to find a valid LAN IP:
+/// 1. UDP connect trick to Google DNS (8.8.8.8)
+/// 2. UDP connect trick to Cloudflare DNS (1.1.1.1)
+/// 3. UDP connect trick to OpenDNS (208.67.222.222)
+/// 4. On Windows: parse ipconfig output directly
+///
+/// Returns None only if no valid LAN interface is found.
 pub fn local_ip() -> Option<String> {
-    // Use a UDP connect trick – no packet is actually sent.
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ip) => Some(ip.to_string()),
-        _ => None,
+    // Try multiple DNS servers to find a working route
+    let dns_servers = [
+        ("8.8.8.8", 53),
+        ("1.1.1.1", 53),
+        ("208.67.222.222", 443),
+        ("9.9.9.9", 53),
+        ("1.0.0.1", 53),
+    ];
+
+    for (ip, port) in dns_servers {
+        let addr = format!("{}:{}", ip, port);
+        if let Some(local) = try_local_ip(&addr) {
+            return Some(local);
+        }
     }
+
+    // Fallback for Windows: parse ipconfig directly
+    #[cfg(windows)]
+    {
+        if let Some(ip) = get_windows_lan_ip() {
+            return Some(ip);
+        }
+    }
+
+    None
+}
+
+fn try_local_ip(target: &str) -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    if socket.connect(target).is_ok() {
+        if let Some(IpAddr::V4(ip)) = socket.local_addr().ok().map(|a| a.ip()) {
+            // Reject loopback and undefined addresses
+            if !ip.is_loopback() && !ip.is_unspecified() {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn get_windows_lan_ip() -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("ipconfig").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Look for lines like "IPv4 Address. . . . . . . . . . : 192.168.1.100"
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.contains("IPv4") && line.contains(":") {
+            if let Some(ip_part) = line.split(':').nth(1) {
+                let ip = ip_part.trim();
+                if let Ok(parsed) = ip.parse::<Ipv4Addr>() {
+                    // Filter out loopback (127.x.x.x) and undefined (0.0.0.0)
+                    if !parsed.is_loopback() && !parsed.is_unspecified() {
+                        return Some(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Start the media HTTP server and return `(actual_port, base_url)`.
@@ -32,7 +96,10 @@ pub async fn start_media_server(
         preferred_port,
     ))
     .or_else(|_| {
-        TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        TcpListener::bind(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        ))
     })
     .context("bind media server TCP listener")?;
 

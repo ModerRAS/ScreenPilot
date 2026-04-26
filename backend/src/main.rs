@@ -1313,6 +1313,8 @@ async fn main() {
     let local_ip = media_server::local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
     let media_base_url = format!("http://{}:8080", local_ip);
 
+    log::info!("Resolved local IP: {} (used for media server and DLNA multicast)", local_ip);
+
     let shared = state::new_shared_state();
 
     // Load saved devices

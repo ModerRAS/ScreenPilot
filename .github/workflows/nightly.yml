@@ -10,37 +10,58 @@ permissions:
 
 jobs:
   build-linux:
-    permissions:
-      contents: write
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for code changes
+        id: check_changes
+        run: |
+          # Check if there were any source code commits in the last 24 hours
+          CHANGED_FILES=$(git log --since="24 hours ago" --name-only --pretty=format: -- backend/ frontend/ 2>/dev/null | grep -E '\.(rs|ts|tsx|vue|css|json|toml)$' | grep -v node_modules | grep -v target | sort -u | wc -l)
+          echo "Source files changed in last 24h: $CHANGED_FILES"
+          if [ "$CHANGED_FILES" -eq 0 ]; then
+            echo "No source code changes in last 24 hours. Skipping build."
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Source code changes detected. Proceeding with build."
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Setup Node.js
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install pnpm
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: npm install -g pnpm
 
       - name: Install Rust
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install frontend dependencies
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: pnpm install --frozen-lockfile
         working-directory: ./frontend
 
       - name: Build frontend
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: pnpm build
         working-directory: ./frontend
 
       - name: Build backend
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: cargo build --release
         working-directory: .
 
       - name: Create release archive
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: |
           mkdir -p release
           cp ./target/release/screen-pilot-backend release/
@@ -48,6 +69,7 @@ jobs:
           tar -czvf screen-pilot-x86_64-unknown-linux-gnu-nightly.tar.gz release/
 
       - name: Upload release asset
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly-${{ github.run_number }}
@@ -63,38 +85,58 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-macos-arm:
-    permissions:
-      contents: write
     runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for code changes
+        id: check_changes
+        run: |
+          CHANGED_FILES=$(git log --since="24 hours ago" --name-only --pretty=format: -- backend/ frontend/ 2>/dev/null | grep -E '\.(rs|ts|tsx|vue|css|json|toml)$' | grep -v node_modules | grep -v target | sort -u | wc -l)
+          echo "Source files changed in last 24h: $CHANGED_FILES"
+          if [ "$CHANGED_FILES" -eq 0 ]; then
+            echo "No source code changes in last 24 hours. Skipping build."
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Source code changes detected. Proceeding with build."
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Setup Node.js
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install pnpm
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: npm install -g pnpm
 
       - name: Install Rust
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
 
       - name: Install frontend dependencies
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: pnpm install --frozen-lockfile
         working-directory: ./frontend
 
       - name: Build frontend
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: pnpm build
         working-directory: ./frontend
 
       - name: Build backend
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: cargo build --release --target aarch64-apple-darwin
 
       - name: Create release archive
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: |
           mkdir -p release
           cp ./target/aarch64-apple-darwin/release/screen-pilot-backend release/
@@ -102,6 +144,7 @@ jobs:
           tar -czvf screen-pilot-aarch64-apple-darwin-nightly.tar.gz release/
 
       - name: Upload release asset
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly-${{ github.run_number }}
@@ -117,38 +160,58 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-macos-intel:
-    permissions:
-      contents: write
     runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for code changes
+        id: check_changes
+        run: |
+          CHANGED_FILES=$(git log --since="24 hours ago" --name-only --pretty=format: -- backend/ frontend/ 2>/dev/null | grep -E '\.(rs|ts|tsx|vue|css|json|toml)$' | grep -v node_modules | grep -v target | sort -u | wc -l)
+          echo "Source files changed in last 24h: $CHANGED_FILES"
+          if [ "$CHANGED_FILES" -eq 0 ]; then
+            echo "No source code changes in last 24 hours. Skipping build."
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Source code changes detected. Proceeding with build."
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Setup Node.js
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install pnpm
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: npm install -g pnpm
 
       - name: Install Rust
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
 
       - name: Install frontend dependencies
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: pnpm install --frozen-lockfile
         working-directory: ./frontend
 
       - name: Build frontend
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: pnpm build
         working-directory: ./frontend
 
       - name: Build backend
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: cargo build --release --target x86_64-apple-darwin
 
       - name: Create release archive
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: |
           mkdir -p release
           cp ./target/x86_64-apple-darwin/release/screen-pilot-backend release/
@@ -156,6 +219,7 @@ jobs:
           tar -czvf screen-pilot-x86_64-apple-darwin-nightly.tar.gz release/
 
       - name: Upload release asset
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly-${{ github.run_number }}
@@ -171,36 +235,57 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-windows:
-    permissions:
-      contents: write
     runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for code changes
+        id: check_changes
+        shell: bash
+        run: |
+          CHANGED_FILES=$(git log --since="24 hours ago" --name-only --pretty=format: -- backend/ frontend/ 2>/dev/null | grep -E '\.(rs|ts|tsx|vue|css|json|toml)$' | grep -v node_modules | grep -v target | sort -u | wc -l)
+          echo "Source files changed in last 24h: $CHANGED_FILES"
+          if [ "$CHANGED_FILES" -eq 0 ]; then
+            echo "No source code changes in last 24 hours. Skipping build."
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Source code changes detected. Proceeding with build."
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Setup Node.js
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install pnpm
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: npm install -g pnpm
 
       - name: Install Rust
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install frontend dependencies
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: pnpm install --frozen-lockfile
         working-directory: ./frontend
 
       - name: Build frontend
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: pnpm build
         working-directory: ./frontend
 
       - name: Build backend
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: cargo build --release
 
       - name: Create release archive
+        if: steps.check_changes.outputs.skip_build != 'true'
         run: |
           mkdir -p release
           cp ./target/release/screen-pilot-backend.exe release/
@@ -208,6 +293,7 @@ jobs:
           powershell -Command "Compress-Archive -Path release/* -DestinationPath screen-pilot-x86_64-pc-windows-msvc-nightly.zip"
 
       - name: Upload release asset
+        if: steps.check_changes.outputs.skip_build != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly-${{ github.run_number }}

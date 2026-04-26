@@ -1,13 +1,11 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
-use std::io::Read;
 
 use anyhow::{Context, Result};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use regex::Regex;
 use reqwest::Client;
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::time::sleep;
 
 use crate::media_server;
 use crate::state::RendererDevice;
@@ -57,18 +55,36 @@ fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> 
         .set_multicast_loop_v4(true)
         .context("set_multicast_loop_v4")?;
 
-    let multicast_iface = media_server::local_ip()
+    let local_ip_result = media_server::local_ip();
+    
+    // local_ip() uses UDP connect trick to 8.8.8.8:80 - fails without internet
+    if local_ip_result.is_none() {
+        warn!("local_ip() returned None - likely no internet connectivity or network issue.");
+        warn!("DLNA discovery requires internet connectivity to determine the LAN interface IP.");
+    }
+    
+    let multicast_iface = local_ip_result
+        .as_ref()
         .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
         .unwrap_or_else(|| Ipv4Addr::new(0, 0, 0, 0));
 
-    info!("Using local IP {} for multicast interface", multicast_iface);
+    // Warn if we got loopback or undefined - DLNA won't work over localhost
+    if multicast_iface.is_loopback() || multicast_iface == Ipv4Addr::new(0, 0, 0, 0) {
+        warn!("local_ip() returned {} - this is not a LAN interface! DLNA discovery may fail.", multicast_iface);
+        warn!("Check network configuration: ensure machine has a valid LAN IP (not 127.0.0.1) and internet connectivity.");
+    }
 
-    raw_socket
+    info!("Using local IP {} for multicast interface. This MUST be the LAN IP for DLNA discovery to work.", multicast_iface);
+
+    if let Err(e) = raw_socket
         .join_multicast_v4(
             &"239.255.255.250".parse::<Ipv4Addr>().unwrap(),
             &multicast_iface,
         )
-        .context("join_multicast_v4")?;
+        .context("join_multicast_v4") {
+        error!("Failed to join SSDP multicast group: {}. DLNA discovery will not work.", e);
+        return Err(e);
+    }
 
     let socket: UdpSocket = raw_socket.into();
     socket
@@ -81,6 +97,7 @@ fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> 
          MAN: \"ssdp:discover\"\r\n\
          MX: {}\r\n\
          ST: {}\r\n\
+         USER-AGENT: ScreenPilot/1.0\r\n\
          \r\n",
         SSDP_ADDR, SSDP_PORT, MX, target
     );
@@ -283,7 +300,7 @@ pub async fn discover_renderers() -> Vec<RendererDevice> {
     let locations = match ssdp_search(Duration::from_secs(MX as u64 + 1)) {
         Ok(l) => l,
         Err(e) => {
-            warn!("SSDP search failed: {e}");
+            error!("SSDP search failed: {}. Check firewall settings and network connectivity.", e);
             return vec![];
         }
     };
