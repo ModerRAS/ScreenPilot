@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use axum::{Router, routing::get_service};
+use axum::{routing::get_service, Router};
 use log::info;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -7,78 +7,93 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 /// Pick the first non-loopback IPv4 address of the host.
-///
-/// Tries multiple methods to find a valid LAN IP:
-/// 1. UDP connect trick to Google DNS (8.8.8.8)
-/// 2. UDP connect trick to Cloudflare DNS (1.1.1.1)
-/// 3. UDP connect trick to OpenDNS (208.67.222.222)
-/// 4. On Windows: parse ipconfig output directly
-///
-/// Returns None only if no valid LAN interface is found.
 pub fn local_ip() -> Option<String> {
-    // Try multiple DNS servers to find a working route
-    let dns_servers = [
-        ("8.8.8.8", 53),
-        ("1.1.1.1", 53),
-        ("208.67.222.222", 443),
-        ("9.9.9.9", 53),
-        ("1.0.0.1", 53),
-    ];
-
-    for (ip, port) in dns_servers {
-        let addr = format!("{}:{}", ip, port);
-        if let Some(local) = try_local_ip(&addr) {
-            return Some(local);
-        }
-    }
-
-    // Fallback for Windows: parse ipconfig directly
-    #[cfg(windows)]
-    {
-        if let Some(ip) = get_windows_lan_ip() {
-            return Some(ip);
-        }
-    }
-
-    None
+    local_ipv4_candidates()
+        .into_iter()
+        .next()
+        .map(|ip| ip.to_string())
 }
 
-fn try_local_ip(target: &str) -> Option<String> {
+/// Return LAN IPv4 candidates in preference order.
+///
+/// SSDP multicast can fail on multi-adapter machines if the wrong outgoing
+/// interface is selected, so callers can use this list to choose a LAN route.
+pub fn local_ipv4_candidates() -> Vec<Ipv4Addr> {
+    let mut candidates = Vec::new();
+
+    // Keep the old successful probe first for compatibility with environments
+    // where DNS ports are filtered but normal web routing is available.
+    let route_probes = [
+        "8.8.8.8:80",
+        "1.1.1.1:80",
+        "8.8.8.8:53",
+        "1.1.1.1:53",
+        "208.67.222.222:443",
+        "9.9.9.9:53",
+    ];
+
+    for target in route_probes {
+        if let Some(local) = try_local_ip(target) {
+            push_unique_ip(&mut candidates, local);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        for ip in get_windows_lan_ips() {
+            push_unique_ip(&mut candidates, ip);
+        }
+    }
+
+    candidates
+}
+
+fn try_local_ip(target: &str) -> Option<Ipv4Addr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     if socket.connect(target).is_ok() {
         if let Some(IpAddr::V4(ip)) = socket.local_addr().ok().map(|a| a.ip()) {
-            // Reject loopback and undefined addresses
-            if !ip.is_loopback() && !ip.is_unspecified() {
-                return Some(ip.to_string());
+            if is_usable_lan_ip(ip) {
+                return Some(ip);
             }
         }
     }
     None
 }
 
+fn push_unique_ip(ips: &mut Vec<Ipv4Addr>, ip: Ipv4Addr) {
+    if is_usable_lan_ip(ip) && !ips.contains(&ip) {
+        ips.push(ip);
+    }
+}
+
+fn is_usable_lan_ip(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast()
+}
+
 #[cfg(windows)]
-fn get_windows_lan_ip() -> Option<String> {
+fn get_windows_lan_ips() -> Vec<Ipv4Addr> {
     use std::process::Command;
 
-    let output = Command::new("ipconfig").output().ok()?;
+    let Some(output) = Command::new("ipconfig").output().ok() else {
+        return vec![];
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut ips = Vec::new();
 
-    // Look for lines like "IPv4 Address. . . . . . . . . . : 192.168.1.100"
+    // English and localized Windows output both keep "IPv4" in these lines.
     for line in stdout.lines() {
         let line = line.trim();
-        if line.contains("IPv4") && line.contains(":") {
-            if let Some(ip_part) = line.split(':').nth(1) {
+        if line.contains("IPv4") {
+            if let Some(ip_part) = line.rsplit(':').next() {
                 let ip = ip_part.trim();
                 if let Ok(parsed) = ip.parse::<Ipv4Addr>() {
-                    // Filter out loopback (127.x.x.x) and undefined (0.0.0.0)
-                    if !parsed.is_loopback() && !parsed.is_unspecified() {
-                        return Some(ip.to_string());
-                    }
+                    push_unique_ip(&mut ips, parsed);
                 }
             }
         }
     }
-    None
+
+    ips
 }
 
 /// Start the media HTTP server and return `(actual_port, base_url)`.
@@ -86,21 +101,13 @@ fn get_windows_lan_ip() -> Option<String> {
 /// The server serves all files under `media_dir` at `/media/<filename>`.
 /// It binds to `0.0.0.0:port`; callers should use `local_ip()` to build
 /// the public URL.
-pub async fn start_media_server(
-    media_dir: PathBuf,
-    preferred_port: u16,
-) -> Result<(u16, String)> {
+pub async fn start_media_server(media_dir: PathBuf, preferred_port: u16) -> Result<(u16, String)> {
     // Try the preferred port first; fall back to any available port.
     let listener = TcpListener::bind(SocketAddr::new(
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         preferred_port,
     ))
-    .or_else(|_| {
-        TcpListener::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            0,
-        ))
-    })
+    .or_else(|_| TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)))
     .context("bind media server TCP listener")?;
 
     let port = listener.local_addr()?.port();
@@ -120,8 +127,8 @@ pub async fn start_media_server(
 
     // Convert std listener to tokio listener
     listener.set_nonblocking(true).context("set_nonblocking")?;
-    let tokio_listener = tokio::net::TcpListener::from_std(listener)
-        .context("convert to tokio TcpListener")?;
+    let tokio_listener =
+        tokio::net::TcpListener::from_std(listener).context("convert to tokio TcpListener")?;
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(tokio_listener, app).await {
@@ -197,8 +204,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Try to fetch the file
-        let url = format!("{}/media/test.mp4", base_url);
-        let resp = reqwest::get(&url).await.unwrap();
+        let url = format!("http://127.0.0.1:{}/media/test.mp4", port);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.bytes().await.unwrap();
         assert_eq!(body.as_ref(), b"fake video content");

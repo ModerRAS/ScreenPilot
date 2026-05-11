@@ -1,6 +1,5 @@
 use log::warn;
 use std::fs;
-use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::state::RendererDevice;
@@ -79,8 +78,13 @@ pub fn save_devices(devices: &[RendererDevice]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    fn persistence_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn test_get_persistence_path() {
@@ -91,6 +95,7 @@ mod tests {
 
     #[test]
     fn test_load_devices_nonexistent() {
+        let _guard = persistence_test_lock();
         // Remove file if exists to test non-existent case
         let path = get_persistence_path();
         let _ = fs::remove_file(&path);
@@ -101,6 +106,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_devices() {
+        let _guard = persistence_test_lock();
         let path = get_persistence_path();
 
         // Create test devices
@@ -142,6 +148,7 @@ mod tests {
 
     #[test]
     fn test_save_devices_invalid_path() {
+        let _guard = persistence_test_lock();
         let test_devices = vec![RendererDevice {
             uuid: "test".to_string(),
             name: "Test".to_string(),
