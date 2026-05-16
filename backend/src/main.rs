@@ -8,10 +8,12 @@ mod state;
 
 use crate::encoder::{detect_hw_encoders, DetectionResult};
 
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path as FilePath, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
@@ -29,6 +31,9 @@ use tower_http::services::ServeDir;
 
 use frontend::Frontend;
 use state::{PlaybackStatus, RendererDevice, Scene, SharedState};
+
+static CACHE_JOB_LOCKS: Lazy<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    Lazy::new(|| StdMutex::new(HashMap::new()));
 
 async fn serve_frontend() -> impl axum::response::IntoResponse {
     let html = Frontend::get("index.html")
@@ -486,6 +491,43 @@ fn check_cache(media_dir: &PathBuf, filename: &str, profile: CacheProfile) -> Op
     None
 }
 
+fn cache_job_lock(media_dir: &PathBuf, filename: &str, profile: CacheProfile) -> Arc<Mutex<()>> {
+    let cache_path = get_cache_path(media_dir, filename, profile);
+    let mut locks = CACHE_JOB_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    Arc::clone(
+        locks
+            .entry(cache_path)
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+async fn with_cache_job_lock<F, Fut>(
+    media_dir: &PathBuf,
+    filename: &str,
+    profile: CacheProfile,
+    create_cache: F,
+) -> Result<PathBuf, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<PathBuf, String>>,
+{
+    if let Some(cache_path) = check_cache(media_dir, filename, profile) {
+        return Ok(cache_path);
+    }
+
+    let lock = cache_job_lock(media_dir, filename, profile);
+    let _guard = lock.lock().await;
+
+    if let Some(cache_path) = check_cache(media_dir, filename, profile) {
+        return Ok(cache_path);
+    }
+
+    create_cache().await
+}
+
 #[derive(Debug, Clone)]
 struct MediaInfo {
     format_name: Option<String>,
@@ -731,6 +773,13 @@ async fn remux_to_cache(media_dir: &PathBuf, filename: &str) -> Result<PathBuf, 
         .map_err(|e| format!("Remux task failed: {}", e))?
 }
 
+async fn remux_to_cache_once(media_dir: &PathBuf, filename: &str) -> Result<PathBuf, String> {
+    with_cache_job_lock(media_dir, filename, CacheProfile::RemuxTs, || async {
+        remux_to_cache(media_dir, filename).await
+    })
+    .await
+}
+
 fn remux_to_cache_blocking(media_dir: PathBuf, filename: String) -> Result<PathBuf, String> {
     let cache_path = get_cache_path(&media_dir, &filename, CacheProfile::RemuxTs);
     run_ffmpeg_cache_job(
@@ -767,6 +816,33 @@ fn transcode_to_cache_blocking(
         },
         "Transcode",
     )
+}
+
+async fn transcode_to_cache_once(
+    media_dir: &PathBuf,
+    filename: &str,
+    encoder: &HardwareEncoder,
+) -> Result<PathBuf, String> {
+    with_cache_job_lock(
+        media_dir,
+        filename,
+        CacheProfile::TranscodedH264Aac,
+        || async {
+            match transcode_to_cache(media_dir, filename, encoder).await {
+                Ok(path) => Ok(path),
+                Err(e) if !matches!(encoder, HardwareEncoder::None) => {
+                    log::warn!(
+                        "Preferred encoder {:?} failed, falling back to software: {}",
+                        encoder,
+                        e
+                    );
+                    transcode_to_cache(media_dir, filename, &HardwareEncoder::None).await
+                }
+                Err(e) => Err(e),
+            }
+        },
+    )
+    .await
 }
 
 fn run_ffmpeg_cache_job(
@@ -851,10 +927,7 @@ async fn prepare_media_for_dlna(
         }
         if has_safe_dlna_codecs(&info) {
             log::info!("Remuxing safe codecs into DLNA-friendly TS: {}", filename);
-            if let Some(cache_path) = check_cache(media_dir, filename, CacheProfile::RemuxTs) {
-                return Ok(PreparedMedia::Remuxed(cache_path));
-            }
-            return remux_to_cache(media_dir, filename)
+            return remux_to_cache_once(media_dir, filename)
                 .await
                 .map(PreparedMedia::Remuxed);
         }
@@ -866,24 +939,9 @@ async fn prepare_media_for_dlna(
         );
     }
 
-    if let Some(cache_path) = check_cache(media_dir, filename, CacheProfile::TranscodedH264Aac) {
-        return Ok(PreparedMedia::Transcoded(cache_path));
-    }
-
-    match transcode_to_cache(media_dir, filename, encoder).await {
-        Ok(path) => Ok(PreparedMedia::Transcoded(path)),
-        Err(e) if !matches!(encoder, HardwareEncoder::None) => {
-            log::warn!(
-                "Preferred encoder {:?} failed, falling back to software: {}",
-                encoder,
-                e
-            );
-            transcode_to_cache(media_dir, filename, &HardwareEncoder::None)
-                .await
-                .map(PreparedMedia::Transcoded)
-        }
-        Err(e) => Err(e),
-    }
+    transcode_to_cache_once(media_dir, filename, encoder)
+        .await
+        .map(PreparedMedia::Transcoded)
 }
 
 fn media_stream_url(media_base: &str, filename: &str) -> String {
@@ -1651,6 +1709,69 @@ mod tests {
         );
         assert!(result.is_some());
         assert!(result.unwrap().to_string_lossy().contains(".cache"));
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cache_job_lock_deduplicates_concurrent_creators() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let media_dir = temp_dir.path().to_path_buf();
+        std::fs::write(media_dir.join("shared.mp4"), b"original").unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let creator_calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(6));
+        let mut tasks = Vec::new();
+
+        for _ in 0..6 {
+            let media_dir = media_dir.clone();
+            let creator_calls = Arc::clone(&creator_calls);
+            let barrier = Arc::clone(&barrier);
+
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+
+                with_cache_job_lock(
+                    &media_dir,
+                    "shared.mp4",
+                    CacheProfile::TranscodedH264Aac,
+                    || {
+                        let media_dir = media_dir.clone();
+                        let creator_calls = Arc::clone(&creator_calls);
+
+                        async move {
+                            creator_calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+                            let cache_path = get_cache_path(
+                                &media_dir,
+                                "shared.mp4",
+                                CacheProfile::TranscodedH264Aac,
+                            );
+                            std::fs::create_dir_all(get_cache_dir(&media_dir)).unwrap();
+                            std::fs::write(&cache_path, b"cached").unwrap();
+
+                            Ok(cache_path)
+                        }
+                    },
+                )
+                .await
+            }));
+        }
+
+        for task in tasks {
+            let path = task.await.unwrap().unwrap();
+            assert_eq!(
+                path,
+                get_cache_path(&media_dir, "shared.mp4", CacheProfile::TranscodedH264Aac)
+            );
+        }
+
+        assert_eq!(creator_calls.load(Ordering::SeqCst), 1);
 
         drop(temp_dir);
     }
