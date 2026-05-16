@@ -60,7 +60,7 @@ pub struct AppState {
     pub media_server_base_url: String,
     /// Preferred encoder: "auto", "nvidia", "amd", "intel", "apple", "vaapi", "software"
     pub preferred_encoder: String,
-    /// Loop playback for transcoded stream
+    /// Default/global loop playback preference.
     pub loop_playback: bool,
     /// Cached hardware encoder detection result
     pub detected_encoders: Option<DetectionResult>,

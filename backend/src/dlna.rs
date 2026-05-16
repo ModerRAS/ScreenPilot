@@ -94,15 +94,49 @@ pub async fn stop(client: &Client, av_transport_url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Full play sequence: Stop → SetAVTransportURI → Play.
+/// SetPlayMode — request a renderer-side play mode when supported.
+pub async fn set_play_mode(
+    client: &Client,
+    av_transport_url: &str,
+    play_mode: &str,
+) -> Result<()> {
+    let args = format!("<NewPlayMode>{}</NewPlayMode>", xml_escape(play_mode));
+    let body = soap_envelope("SetPlayMode", &args);
+    send_soap(client, av_transport_url, "SetPlayMode", &body).await?;
+    Ok(())
+}
+
+/// Full play sequence: Stop → SetAVTransportURI → optional SetPlayMode → Play.
 pub async fn play_media(
     client: &Client,
     av_transport_url: &str,
     media_uri: &str,
+    loop_playback: bool,
 ) -> Result<()> {
     // Stop first (best-effort – ignore errors)
     let _ = stop(client, av_transport_url).await;
     set_av_transport_uri(client, av_transport_url, media_uri).await?;
+    let play_mode = if loop_playback { "REPEAT_ONE" } else { "NORMAL" };
+    match tokio::time::timeout(
+        Duration::from_secs(1),
+        set_play_mode(client, av_transport_url, play_mode),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            debug!(
+                "Renderer did not accept AVTransport SetPlayMode {}: {}",
+                play_mode, e
+            );
+        }
+        Err(_) => {
+            debug!(
+                "Renderer timed out on AVTransport SetPlayMode {}, continuing playback",
+                play_mode
+            );
+        }
+    }
     play(client, av_transport_url).await?;
     Ok(())
 }
@@ -146,6 +180,13 @@ mod tests {
     fn test_soap_envelope_stop() {
         let body = soap_envelope("Stop", "");
         assert!(body.contains("<u:Stop xmlns:u="));
+    }
+
+    #[test]
+    fn test_soap_envelope_set_play_mode() {
+        let body = soap_envelope("SetPlayMode", "<NewPlayMode>REPEAT_ONE</NewPlayMode>");
+        assert!(body.contains("<u:SetPlayMode xmlns:u="));
+        assert!(body.contains("<NewPlayMode>REPEAT_ONE</NewPlayMode>"));
     }
 
     #[test]

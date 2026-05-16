@@ -15,7 +15,6 @@ use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path as FilePath, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -520,7 +519,7 @@ async fn play_on_device(
 ) -> Result<StatusCode, ApiError> {
     validate_media_filename(&body.media_filename)?;
 
-    let (av_url, media_base) = {
+    let (av_url, media_base, loop_playback) = {
         let st = app.shared.read().await;
         let device = st
             .devices
@@ -535,12 +534,13 @@ async fn play_on_device(
         (
             device.av_transport_url.clone(),
             st.media_server_base_url.clone(),
+            device.loop_playback,
         )
     };
     let media_uri = prepare_media_uri(&app, &media_base, &body.media_filename).await?;
 
     let client = app.client.lock().await;
-    dlna::play_media(&client, &av_url, &media_uri)
+    dlna::play_media(&client, &av_url, &media_uri, loop_playback)
         .await
         .map_err(|e| error_response(StatusCode::BAD_GATEWAY, e.to_string()))?;
 
@@ -859,7 +859,7 @@ fn check_cache(media_dir: &PathBuf, filename: &str, profile: CacheProfile) -> Op
                 (original_meta.modified(), cache_meta.modified())
             {
                 if cache_modified > original_modified {
-                    log::info!("Cache found: {:?}", cache_path);
+                    log::debug!("Cache found: {:?}", cache_path);
                     return Some(cache_path);
                 }
             }
@@ -1028,10 +1028,6 @@ impl PreparedMedia {
             PreparedMedia::Original(path) => content_type_for_path(path),
             PreparedMedia::Remuxed(_) | PreparedMedia::Transcoded(_) => "video/mp2t",
         }
-    }
-
-    fn needs_loop_stream(&self, loop_playback: bool) -> bool {
-        loop_playback
     }
 }
 
@@ -1320,13 +1316,20 @@ async fn prepare_media_for_dlna(
         return Err("Media file not found".to_string());
     }
 
+    if let Some(cache_path) = check_cache(media_dir, filename, CacheProfile::RemuxTs) {
+        return Ok(PreparedMedia::Remuxed(cache_path));
+    }
+    if let Some(cache_path) = check_cache(media_dir, filename, CacheProfile::TranscodedH264Aac) {
+        return Ok(PreparedMedia::Transcoded(cache_path));
+    }
+
     if let Some(info) = probe_media_info(&media_path) {
         if is_dlna_bypass_compatible(&info, filename) {
-            log::info!("Bypassing transcode for DLNA-safe media: {}", filename);
+            log::debug!("Bypassing transcode for DLNA-safe media: {}", filename);
             return Ok(PreparedMedia::Original(media_path));
         }
         if has_safe_dlna_codecs(&info) {
-            log::info!("Remuxing safe codecs into DLNA-friendly TS: {}", filename);
+            log::info!("Creating DLNA-friendly TS remux cache: {}", filename);
             return remux_to_cache_once(media_dir, filename)
                 .await
                 .map(PreparedMedia::Remuxed);
@@ -1446,98 +1449,6 @@ async fn serve_file_response(
         .into_response())
 }
 
-fn stream_copy_with_ffmpeg(
-    path: &FilePath,
-    loop_playback: bool,
-) -> Result<axum::response::Response, ApiError> {
-    use std::io::Read;
-
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Media path is not valid UTF-8",
-            )
-        })?
-        .to_string();
-
-    let mut cmd = std::process::Command::new("ffmpeg");
-    cmd.arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("warning")
-        .arg("-nostdin");
-
-    if loop_playback {
-        cmd.arg("-stream_loop").arg("-1");
-    }
-
-    cmd.arg("-re")
-        .arg("-i")
-        .arg(&path_str)
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
-        .arg("0:a:0?")
-        .arg("-c")
-        .arg("copy")
-        .arg("-f")
-        .arg("mpegts")
-        .arg("-mpegts_flags")
-        .arg("+resend_headers")
-        .arg("-");
-
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-
-    let mut child = cmd.spawn().map_err(|e| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to start ffmpeg: {}", e),
-        )
-    })?;
-
-    let mut stdout = child.stdout.take().ok_or_else(|| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to capture ffmpeg output",
-        )
-    })?;
-
-    let _ = std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-
-    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
-
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 65536];
-        loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(Ok(buf[..n].to_vec())).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let stream = async_stream::stream! {
-        while let Some(chunk) = rx.recv().await {
-            yield chunk;
-        }
-    };
-
-    Ok((
-        [("Content-Type", "video/mp2t")],
-        axum::body::Body::from_stream(stream),
-    )
-        .into_response())
-}
-
 fn content_type_for_path(path: &FilePath) -> &'static str {
     match path
         .extension()
@@ -1568,28 +1479,23 @@ async fn stream_media(
         ));
     }
 
-    let (encoder_pref, loop_playback) = {
+    let encoder_pref = {
         let st = app.shared.read().await;
-        (st.preferred_encoder.clone(), st.loop_playback)
+        st.preferred_encoder.clone()
     };
 
     let hw_encoder = get_encoder_from_preference(&encoder_pref);
-    log::info!(
-        "Serving prepared media with encoder preference: {} -> {:?}, loop: {}",
+    log::debug!(
+        "Serving prepared media with encoder preference: {} -> {:?}",
         encoder_pref,
-        hw_encoder,
-        loop_playback
+        hw_encoder
     );
 
     let prepared = prepare_media_for_dlna(&app.media_dir, &filename, &hw_encoder)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    if prepared.needs_loop_stream(loop_playback) {
-        stream_copy_with_ffmpeg(prepared.path(), loop_playback)
-    } else {
-        serve_file_response(prepared.path(), prepared.content_type()).await
-    }
+    serve_file_response(prepared.path(), prepared.content_type()).await
 }
 
 fn remove_media_cache_files(media_dir: &PathBuf, filename: &str) {
@@ -1850,17 +1756,28 @@ async fn apply_scene(
 
     let mut results = Vec::new();
     for (uuid, filename) in &assignments {
-        let av_url = match resolve_av_url(&app, uuid).await {
-            Ok(u) => u,
-            Err(e) => {
-                results.push(SceneApplyResult {
-                    device_uuid: uuid.clone(),
-                    success: false,
-                    error: Some(e),
-                });
-                continue;
+        let (av_url, loop_playback) = {
+            let st = app.shared.read().await;
+            match st.devices.iter().find(|d| d.uuid == *uuid) {
+                Some(device) => (device.av_transport_url.clone(), device.loop_playback),
+                None => {
+                    results.push(SceneApplyResult {
+                        device_uuid: uuid.clone(),
+                        success: false,
+                        error: Some(format!("Device not found: {}", uuid)),
+                    });
+                    continue;
+                }
             }
         };
+        if av_url.is_empty() {
+            results.push(SceneApplyResult {
+                device_uuid: uuid.clone(),
+                success: false,
+                error: Some(format!("Device AVTransport URL is empty: {}", uuid)),
+            });
+            continue;
+        }
         let media_uri = match prepare_media_uri(&app, &media_base, filename).await {
             Ok(uri) => uri,
             Err((_, Json(err))) => {
@@ -1873,7 +1790,7 @@ async fn apply_scene(
             }
         };
         let client = app.client.lock().await;
-        match dlna::play_media(&client, &av_url, &media_uri).await {
+        match dlna::play_media(&client, &av_url, &media_uri, loop_playback).await {
             Ok(_) => {
                 drop(client);
                 let mut st = app.shared.write().await;
