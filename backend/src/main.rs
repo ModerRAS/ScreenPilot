@@ -105,6 +105,7 @@ pub struct WebAppState {
     pub media_dir: PathBuf,
     pub cached_encoders: Arc<Mutex<Option<DetectionResult>>>,
     pub auth: Arc<AuthState>,
+    pub media_cache_prewarm_tx: tokio_mpsc::UnboundedSender<String>,
 }
 
 #[derive(Debug)]
@@ -1374,6 +1375,46 @@ async fn prepare_media_uri(
     Ok(media_stream_url(media_base, filename))
 }
 
+fn enqueue_media_cache_prewarm(app: &WebAppState, filename: &str) {
+    if let Err(e) = app.media_cache_prewarm_tx.send(filename.to_string()) {
+        log::warn!("Failed to enqueue media cache prewarm for {}: {}", filename, e);
+    }
+}
+
+async fn run_media_cache_prewarm_worker(
+    shared: SharedState,
+    media_dir: PathBuf,
+    mut rx: tokio_mpsc::UnboundedReceiver<String>,
+) {
+    while let Some(filename) = rx.recv().await {
+        let encoder_pref = {
+            let st = shared.read().await;
+            st.preferred_encoder.clone()
+        };
+        let encoder = get_encoder_from_preference(&encoder_pref);
+
+        log::info!(
+            "Prewarming DLNA media cache for {} with encoder preference: {} -> {:?}",
+            filename,
+            encoder_pref,
+            encoder
+        );
+
+        match prepare_media_for_dlna(&media_dir, &filename, &encoder).await {
+            Ok(prepared) => {
+                log::info!(
+                    "Prewarmed DLNA media cache for {} at {:?}",
+                    filename,
+                    prepared.path()
+                );
+            }
+            Err(e) => {
+                log::warn!("Failed to prewarm DLNA media cache for {}: {}", filename, e);
+            }
+        }
+    }
+}
+
 async fn serve_file_response(
     path: &FilePath,
     content_type: &'static str,
@@ -1636,6 +1677,7 @@ async fn upload_media(
                 })?;
 
             let file = media_file_info(&app.media_dir, &filename)?;
+            enqueue_media_cache_prewarm(&app, &filename);
             return Ok(Json(UploadMediaResponse { file }));
         }
     }
@@ -1732,7 +1774,9 @@ async fn rename_media_file(
     }
     drop(st);
 
-    Ok(Json(media_file_info(&app.media_dir, &body.new_name)?))
+    let file = media_file_info(&app.media_dir, &body.new_name)?;
+    enqueue_media_cache_prewarm(&app, &body.new_name);
+    Ok(Json(file))
 }
 
 /// GET /api/scenes — return the list of defined scenes.
@@ -2026,12 +2070,21 @@ async fn main() {
         }
     });
 
+    let (media_cache_prewarm_tx, media_cache_prewarm_rx) =
+        tokio_mpsc::unbounded_channel::<String>();
+    tokio::spawn(run_media_cache_prewarm_worker(
+        shared.clone(),
+        media_dir.clone(),
+        media_cache_prewarm_rx,
+    ));
+
     let app_state = WebAppState {
         shared,
         client: Arc::new(Mutex::new(Client::new())),
         media_dir: media_dir.clone(),
         cached_encoders: Arc::new(Mutex::new(None)),
         auth: Arc::new(AuthState::from_config(loaded_config.config.auth)),
+        media_cache_prewarm_tx,
     };
 
     // CORS — allow the Vue dev server and any other origin
