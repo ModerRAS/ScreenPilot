@@ -15,6 +15,7 @@ use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path as FilePath, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -278,6 +279,7 @@ fn is_public_without_auth(path: &str) -> bool {
     !path.starts_with("/api/")
         || path.starts_with("/api/auth/")
         || path.starts_with("/api/media/stream/")
+        || path.starts_with("/api/media/stream-loop/")
 }
 
 async fn require_auth(State(app): State<WebAppState>, request: Request, next: Next) -> Response {
@@ -538,9 +540,16 @@ async fn play_on_device(
         )
     };
     let media_uri = prepare_media_uri(&app, &media_base, &body.media_filename).await?;
+    let loop_media_uri = media_loop_stream_url(&media_base, &body.media_filename);
 
     let client = app.client.lock().await;
-    dlna::play_media(&client, &av_url, &media_uri, loop_playback)
+    dlna::play_media(
+        &client,
+        &av_url,
+        &media_uri,
+        loop_playback,
+        Some(&loop_media_uri),
+    )
         .await
         .map_err(|e| error_response(StatusCode::BAD_GATEWAY, e.to_string()))?;
 
@@ -1355,6 +1364,14 @@ fn media_stream_url(media_base: &str, filename: &str) -> String {
     )
 }
 
+fn media_loop_stream_url(media_base: &str, filename: &str) -> String {
+    format!(
+        "{}/api/media/stream-loop/{}",
+        media_base.trim_end_matches('/'),
+        percent_encode_path_segment(filename)
+    )
+}
+
 fn percent_encode_path_segment(segment: &str) -> String {
     let mut encoded = String::new();
     for byte in segment.bytes() {
@@ -1449,6 +1466,92 @@ async fn serve_file_response(
         .into_response())
 }
 
+fn stream_loop_with_ffmpeg(path: &FilePath) -> Result<axum::response::Response, ApiError> {
+    use std::io::Read;
+
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Media path is not valid UTF-8",
+            )
+        })?
+        .to_string();
+
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("warning")
+        .arg("-nostdin")
+        .arg("-stream_loop")
+        .arg("-1")
+        .arg("-re")
+        .arg("-i")
+        .arg(&path_str)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("0:a:0?")
+        .arg("-c")
+        .arg("copy")
+        .arg("-f")
+        .arg("mpegts")
+        .arg("-mpegts_flags")
+        .arg("+resend_headers")
+        .arg("-");
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::null());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to start loop stream ffmpeg: {}", e),
+        )
+    })?;
+
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to capture loop stream ffmpeg output",
+        )
+    })?;
+
+    let _ = std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
+
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let stream = async_stream::stream! {
+        while let Some(chunk) = rx.recv().await {
+            yield chunk;
+        }
+    };
+
+    Ok((
+        [("Content-Type", "video/mp2t")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
+}
+
 fn content_type_for_path(path: &FilePath) -> &'static str {
     match path
         .extension()
@@ -1496,6 +1599,37 @@ async fn stream_media(
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     serve_file_response(prepared.path(), prepared.content_type()).await
+}
+
+async fn stream_loop_media(
+    State(app): State<WebAppState>,
+    Path(filename): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    validate_media_filename(&filename)?;
+
+    let media_path = app.media_dir.join(&filename);
+    if !media_path.exists() {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Media file not found",
+        ));
+    }
+
+    let encoder_pref = {
+        let st = app.shared.read().await;
+        st.preferred_encoder.clone()
+    };
+    let hw_encoder = get_encoder_from_preference(&encoder_pref);
+    let prepared = prepare_media_for_dlna(&app.media_dir, &filename, &hw_encoder)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    log::info!(
+        "Serving loop fallback stream for {} from {:?}",
+        filename,
+        prepared.path()
+    );
+    stream_loop_with_ffmpeg(prepared.path())
 }
 
 fn remove_media_cache_files(media_dir: &PathBuf, filename: &str) {
@@ -1790,7 +1924,16 @@ async fn apply_scene(
             }
         };
         let client = app.client.lock().await;
-        match dlna::play_media(&client, &av_url, &media_uri, loop_playback).await {
+        let loop_media_uri = media_loop_stream_url(&media_base, filename);
+        match dlna::play_media(
+            &client,
+            &av_url,
+            &media_uri,
+            loop_playback,
+            Some(&loop_media_uri),
+        )
+        .await
+        {
             Ok(_) => {
                 drop(client);
                 let mut st = app.shared.write().await;
@@ -2046,6 +2189,7 @@ async fn main() {
             "/api/media/upload",
             post(upload_media).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
+        .route("/api/media/stream-loop/*path", get(stream_loop_media))
         .route("/api/media/stream/*path", get(stream_media))
         .route("/api/scenes", get(get_scenes).post(save_scene))
         .route("/api/scenes/:name", delete(delete_scene))
@@ -2135,6 +2279,13 @@ mod tests {
         );
 
         assert_eq!(session_token_from_headers(&headers), Some("abc123"));
+    }
+
+    #[test]
+    fn test_loop_stream_is_public_for_dlna_renderers() {
+        assert!(is_public_without_auth(
+            "/api/media/stream-loop/promo%20loop%2001.mp4"
+        ));
     }
 
     #[test]
@@ -2410,6 +2561,14 @@ mod tests {
         assert_eq!(
             percent_encode_path_segment("菜单.mp4"),
             "%E8%8F%9C%E5%8D%95.mp4"
+        );
+    }
+
+    #[test]
+    fn test_media_loop_stream_url() {
+        assert_eq!(
+            media_loop_stream_url("http://127.0.0.1:8080/", "promo loop 01.mp4"),
+            "http://127.0.0.1:8080/api/media/stream-loop/promo%20loop%2001.mp4"
         );
     }
 

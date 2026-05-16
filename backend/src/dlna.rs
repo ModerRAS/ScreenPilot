@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::debug;
+use log::{debug, warn};
 use reqwest::Client;
 use std::time::Duration;
 
@@ -106,37 +106,59 @@ pub async fn set_play_mode(
     Ok(())
 }
 
-/// Full play sequence: Stop → SetAVTransportURI → optional SetPlayMode → Play.
-pub async fn play_media(
+async fn set_play_mode_best_effort(
     client: &Client,
     av_transport_url: &str,
-    media_uri: &str,
-    loop_playback: bool,
-) -> Result<()> {
-    // Stop first (best-effort – ignore errors)
-    let _ = stop(client, av_transport_url).await;
-    set_av_transport_uri(client, av_transport_url, media_uri).await?;
-    let play_mode = if loop_playback { "REPEAT_ONE" } else { "NORMAL" };
+    play_mode: &str,
+) -> bool {
     match tokio::time::timeout(
         Duration::from_secs(1),
         set_play_mode(client, av_transport_url, play_mode),
     )
     .await
     {
-        Ok(Ok(_)) => {}
+        Ok(Ok(_)) => true,
         Ok(Err(e)) => {
             debug!(
                 "Renderer did not accept AVTransport SetPlayMode {}: {}",
                 play_mode, e
             );
+            false
         }
         Err(_) => {
             debug!(
                 "Renderer timed out on AVTransport SetPlayMode {}, continuing playback",
                 play_mode
             );
+            false
         }
     }
+}
+
+/// Full play sequence: Stop → SetAVTransportURI → optional SetPlayMode → Play.
+pub async fn play_media(
+    client: &Client,
+    av_transport_url: &str,
+    media_uri: &str,
+    loop_playback: bool,
+    loop_media_uri: Option<&str>,
+) -> Result<()> {
+    // Stop first (best-effort – ignore errors)
+    let _ = stop(client, av_transport_url).await;
+    set_av_transport_uri(client, av_transport_url, media_uri).await?;
+
+    if loop_playback {
+        let native_loop = set_play_mode_best_effort(client, av_transport_url, "REPEAT_ONE").await;
+        if !native_loop {
+            if let Some(loop_media_uri) = loop_media_uri {
+                warn!("Renderer does not support native loop playback, falling back to loop stream");
+                set_av_transport_uri(client, av_transport_url, loop_media_uri).await?;
+            }
+        }
+    } else {
+        let _ = set_play_mode_best_effort(client, av_transport_url, "NORMAL").await;
+    }
+
     play(client, av_transport_url).await?;
     Ok(())
 }
