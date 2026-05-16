@@ -11,6 +11,8 @@ pub use crate::encoder::DetectionResult;
 pub struct RendererDevice {
     pub uuid: String,
     pub name: String,
+    #[serde(default)]
+    pub alias: Option<String>,
     pub ip: String,
     pub av_transport_url: String,
     pub status: PlaybackStatus,
@@ -79,6 +81,7 @@ mod tests {
         let device = RendererDevice {
             uuid: "test-uuid-123".to_string(),
             name: "Living Room TV".to_string(),
+            alias: None,
             ip: "192.168.1.100".to_string(),
             av_transport_url: "http://192.168.1.100:49152/upnp/control/AVTransport".to_string(),
             status: PlaybackStatus::Idle,
@@ -96,6 +99,7 @@ mod tests {
         let device1 = RendererDevice {
             uuid: "uuid-1".to_string(),
             name: "Device 1".to_string(),
+            alias: Some("Front Desk".to_string()),
             ip: "192.168.1.1".to_string(),
             av_transport_url: "http://192.168.1.1:8008/ctrl".to_string(),
             status: PlaybackStatus::Playing,
@@ -105,8 +109,26 @@ mod tests {
         let device2 = device1.clone();
         assert_eq!(device1.uuid, device2.uuid);
         assert_eq!(device1.name, device2.name);
+        assert_eq!(device1.alias, device2.alias);
         assert_eq!(device1.status, device2.status);
         assert_eq!(device1.current_media, device2.current_media);
+    }
+
+    #[test]
+    fn test_renderer_device_deserializes_without_alias() {
+        let json = r#"{
+            "uuid": "uuid-1",
+            "name": "Legacy TV",
+            "ip": "192.168.1.10",
+            "av_transport_url": "http://192.168.1.10:8000/ctrl",
+            "status": "idle",
+            "current_media": null,
+            "loop_playback": false
+        }"#;
+
+        let device: RendererDevice = serde_json::from_str(json).unwrap();
+        assert_eq!(device.name, "Legacy TV");
+        assert_eq!(device.alias, None);
     }
 
     #[test]
@@ -172,7 +194,10 @@ mod tests {
 
         let scene: Scene = serde_json::from_str(json).unwrap();
         assert_eq!(scene.name, "Evening Scene");
-        assert_eq!(scene.assignments.get("tv-uuid"), Some(&"movie.mp4".to_string()));
+        assert_eq!(
+            scene.assignments.get("tv-uuid"),
+            Some(&"movie.mp4".to_string())
+        );
     }
 
     #[test]
@@ -188,6 +213,7 @@ mod tests {
         let device = RendererDevice {
             uuid: "test".to_string(),
             name: "Test".to_string(),
+            alias: None,
             ip: "192.168.1.1".to_string(),
             av_transport_url: "http://192.168.1.1:8000".to_string(),
             status: PlaybackStatus::Idle,
@@ -238,7 +264,7 @@ mod tests {
                 let mut write_state = state_clone.write().await;
                 write_state.media_server_base_url = "http://test:8080".to_string();
             }
-            
+
             let read_state = state_clone.read().await;
             assert_eq!(read_state.media_server_base_url, "http://test:8080");
         });

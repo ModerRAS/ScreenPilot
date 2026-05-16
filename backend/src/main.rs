@@ -1,3 +1,4 @@
+mod config;
 mod discovery;
 mod dlna;
 pub mod encoder;
@@ -9,17 +10,18 @@ mod state;
 use crate::encoder::{detect_hw_encoders, DetectionResult};
 
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path as FilePath, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
-use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -27,13 +29,18 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
+use uuid::Uuid;
 
 use frontend::Frontend;
 use state::{PlaybackStatus, RendererDevice, Scene, SharedState};
 
 static CACHE_JOB_LOCKS: Lazy<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     Lazy::new(|| StdMutex::new(HashMap::new()));
+
+const AUTH_COOKIE_NAME: &str = "screenpilot_session";
+const AUTH_COOKIE_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
+const ALLOWED_MEDIA_EXTENSIONS: &[&str] = &["mp4", "webm", "avi", "mkv", "mov"];
+const MAX_UPLOAD_BYTES: usize = 256usize * 1024 * 1024 * 1024;
 
 async fn serve_frontend() -> impl axum::response::IntoResponse {
     let html = Frontend::get("index.html")
@@ -97,6 +104,56 @@ pub struct WebAppState {
     pub client: Arc<Mutex<Client>>,
     pub media_dir: PathBuf,
     pub cached_encoders: Arc<Mutex<Option<DetectionResult>>>,
+    pub auth: Arc<AuthState>,
+}
+
+#[derive(Debug)]
+pub struct AuthState {
+    username: String,
+    password: String,
+    active_sessions: StdMutex<HashSet<String>>,
+}
+
+impl AuthState {
+    fn from_config(config: config::AuthSettings) -> Self {
+        Self {
+            username: config.username,
+            password: config.password,
+            active_sessions: StdMutex::new(HashSet::new()),
+        }
+    }
+
+    fn username(&self) -> &str {
+        &self.username
+    }
+
+    fn verify_credentials(&self, username: &str, password: &str) -> bool {
+        constant_time_eq(username, &self.username) && constant_time_eq(password, &self.password)
+    }
+
+    fn issue_session_token(&self) -> String {
+        let token = generate_secret();
+        self.active_sessions
+            .lock()
+            .expect("active session lock poisoned")
+            .insert(token.clone());
+        token
+    }
+
+    fn revoke_session_token(&self, token: &str) {
+        self.active_sessions
+            .lock()
+            .expect("active session lock poisoned")
+            .retain(|active| !constant_time_eq(active, token));
+    }
+
+    fn verify_session_token(&self, token: &str) -> bool {
+        self.active_sessions
+            .lock()
+            .expect("active session lock poisoned")
+            .iter()
+            .any(|active| constant_time_eq(active, token))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,20 +171,118 @@ struct PlayRequest {
 }
 
 #[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct AuthStatusResponse {
+    authenticated: bool,
+    username: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SetDeviceAliasRequest {
+    alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MediaFileInfo {
+    name: String,
+    size: u64,
+    modified: Option<u64>,
+    extension: String,
+}
+
+#[derive(Serialize)]
+struct UploadMediaResponse {
+    file: MediaFileInfo,
+}
+
+#[derive(Deserialize)]
+struct RenameMediaRequest {
+    new_name: String,
+}
+
+#[derive(Deserialize)]
 struct SaveSceneRequest {
     name: String,
     assignments: HashMap<String, String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
 }
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
 
+const MAX_DEVICE_ALIAS_CHARS: usize = 64;
+
 fn error_response(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(ErrorResponse { error: msg.into() }))
+}
+
+fn generate_secret() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= (left_byte ^ right_byte) as usize;
+    }
+
+    diff == 0
+}
+
+fn session_cookie(token: &str) -> String {
+    format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        AUTH_COOKIE_NAME, token, AUTH_COOKIE_MAX_AGE_SECONDS
+    )
+}
+
+fn expired_session_cookie() -> String {
+    format!(
+        "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+        AUTH_COOKIE_NAME
+    )
+}
+
+fn session_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+
+    cookie.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        (name == AUTH_COOKIE_NAME).then_some(value)
+    })
+}
+
+fn headers_have_valid_session(auth: &AuthState, headers: &HeaderMap) -> bool {
+    session_token_from_headers(headers).is_some_and(|token| auth.verify_session_token(token))
+}
+
+fn is_public_without_auth(path: &str) -> bool {
+    !path.starts_with("/api/")
+        || path.starts_with("/api/auth/")
+        || path.starts_with("/api/media/stream/")
+}
+
+async fn require_auth(State(app): State<WebAppState>, request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    if is_public_without_auth(path) || headers_have_valid_session(&app.auth, request.headers()) {
+        return next.run(request).await;
+    }
+
+    error_response(StatusCode::UNAUTHORIZED, "Authentication required").into_response()
 }
 
 /// Validate that a media filename is safe (no path traversal).
@@ -146,7 +301,130 @@ fn validate_media_filename(filename: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_media_extension(filename: &str) -> Result<String, ApiError> {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_lowercase())
+        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "No file extension"))?;
+
+    if ext == filename.to_lowercase() || !ALLOWED_MEDIA_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid file extension '{}'. Allowed: {:?}",
+                ext, ALLOWED_MEDIA_EXTENSIONS
+            ),
+        ));
+    }
+
+    Ok(ext)
+}
+
+fn validate_media_upload_filename(filename: &str) -> Result<String, ApiError> {
+    validate_media_filename(filename)?;
+    if filename.starts_with('.') {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Media filename must not start with a dot",
+        ));
+    }
+    validate_media_extension(filename)
+}
+
+fn normalize_device_alias(alias: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(alias) = alias else {
+        return Ok(None);
+    };
+
+    if alias.contains('\0') {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid device alias",
+        ));
+    }
+
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Ok(None);
+    }
+
+    if alias.chars().count() > MAX_DEVICE_ALIAS_CHARS {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Device alias must be {} characters or fewer",
+                MAX_DEVICE_ALIAS_CHARS
+            ),
+        ));
+    }
+
+    Ok(Some(alias.to_string()))
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+async fn login(
+    State(app): State<WebAppState>,
+    Json(body): Json<LoginRequest>,
+) -> Result<Response, ApiError> {
+    if !app.auth.verify_credentials(&body.username, &body.password) {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "Invalid username or password",
+        ));
+    }
+
+    let mut response = Json(AuthStatusResponse {
+        authenticated: true,
+        username: Some(app.auth.username().to_string()),
+    })
+    .into_response();
+
+    let token = app.auth.issue_session_token();
+    let cookie = HeaderValue::from_str(&session_cookie(&token)).map_err(|_| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create session cookie",
+        )
+    })?;
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
+
+    Ok(response)
+}
+
+async fn logout(State(app): State<WebAppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    if let Some(token) = session_token_from_headers(&headers) {
+        app.auth.revoke_session_token(token);
+    }
+
+    let mut response = Json(AuthStatusResponse {
+        authenticated: false,
+        username: None,
+    })
+    .into_response();
+
+    let cookie = HeaderValue::from_str(&expired_session_cookie()).map_err(|_| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to clear session cookie",
+        )
+    })?;
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
+
+    Ok(response)
+}
+
+async fn auth_status(
+    State(app): State<WebAppState>,
+    headers: HeaderMap,
+) -> Json<AuthStatusResponse> {
+    let authenticated = headers_have_valid_session(&app.auth, &headers);
+    Json(AuthStatusResponse {
+        authenticated,
+        username: authenticated.then(|| app.auth.username().to_string()),
+    })
+}
 
 /// GET /api/devices — return the current device list without triggering a new scan.
 async fn get_devices(State(app): State<WebAppState>) -> Json<Vec<RendererDevice>> {
@@ -159,18 +437,20 @@ async fn discover_devices(State(app): State<WebAppState>) -> Json<Vec<RendererDe
     let devices = discovery::discover_renderers().await;
     let mut st = app.shared.write().await;
 
-    let existing: HashMap<String, (PlaybackStatus, Option<String>)> = st
+    let existing: HashMap<String, RendererDevice> = st
         .devices
         .iter()
-        .map(|d| (d.uuid.clone(), (d.status.clone(), d.current_media.clone())))
+        .map(|d| (d.uuid.clone(), d.clone()))
         .collect();
 
     let mut merged: Vec<RendererDevice> = devices
         .into_iter()
         .map(|mut d| {
-            if let Some((status, media)) = existing.get(&d.uuid) {
-                d.status = status.clone();
-                d.current_media = media.clone();
+            if let Some(old) = existing.get(&d.uuid) {
+                d.alias = old.alias.clone();
+                d.status = old.status.clone();
+                d.current_media = old.current_media.clone();
+                d.loop_playback = old.loop_playback;
             }
             d
         })
@@ -190,6 +470,41 @@ async fn discover_devices(State(app): State<WebAppState>) -> Json<Vec<RendererDe
     }
 
     Json(merged)
+}
+
+/// PUT /api/devices/:uuid/alias — set or clear a device alias.
+async fn set_device_alias(
+    State(app): State<WebAppState>,
+    Path(device_uuid): Path<String>,
+    Json(body): Json<SetDeviceAliasRequest>,
+) -> Result<Json<RendererDevice>, ApiError> {
+    let alias = normalize_device_alias(body.alias)?;
+
+    let (updated, devices_to_save) = {
+        let mut st = app.shared.write().await;
+        let device = st
+            .devices
+            .iter_mut()
+            .find(|d| d.uuid == device_uuid)
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Device not found: {}", device_uuid),
+                )
+            })?;
+
+        device.alias = alias;
+        (device.clone(), st.devices.clone())
+    };
+
+    persistence::save_devices(&devices_to_save).map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save device alias: {}", e),
+        )
+    })?;
+
+    Ok(Json(updated))
 }
 
 /// POST /api/devices/:uuid/play — play a media file on a specific device.
@@ -298,9 +613,62 @@ async fn set_device_loop(
     Ok(StatusCode::OK)
 }
 
-/// GET /api/media — list available media files.
+fn modified_unix_seconds(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn media_file_info(media_dir: &PathBuf, filename: &str) -> Result<MediaFileInfo, ApiError> {
+    validate_media_upload_filename(filename)?;
+
+    let path = media_dir.join(filename);
+    let metadata = std::fs::metadata(&path).map_err(|e| {
+        error_response(
+            StatusCode::NOT_FOUND,
+            format!("Media file not found: {}", e),
+        )
+    })?;
+
+    if !metadata.is_file() {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Media file not found",
+        ));
+    }
+
+    Ok(MediaFileInfo {
+        name: filename.to_string(),
+        size: metadata.len(),
+        modified: modified_unix_seconds(&metadata),
+        extension: validate_media_extension(filename)?,
+    })
+}
+
+fn list_media_file_infos(media_dir: &PathBuf) -> Vec<MediaFileInfo> {
+    media_server::list_media_files(media_dir)
+        .into_iter()
+        .filter(|filename| validate_media_upload_filename(filename).is_ok())
+        .filter_map(|filename| media_file_info(media_dir, &filename).ok())
+        .collect()
+}
+
+/// GET /api/media — list available media filenames.
 async fn list_media(State(app): State<WebAppState>) -> Json<Vec<String>> {
-    Json(media_server::list_media_files(&app.media_dir))
+    Json(
+        list_media_file_infos(&app.media_dir)
+            .into_iter()
+            .map(|file| file.name)
+            .collect(),
+    )
+}
+
+/// GET /api/media/files — list media files with metadata.
+async fn list_media_files(State(app): State<WebAppState>) -> Json<Vec<MediaFileInfo>> {
+    Json(list_media_file_infos(&app.media_dir))
 }
 
 #[derive(Debug, Clone)]
@@ -818,6 +1186,21 @@ fn transcode_to_cache_blocking(
     )
 }
 
+fn should_fallback_to_software(encoder: &HardwareEncoder) -> bool {
+    !matches!(encoder, HardwareEncoder::None)
+}
+
+fn software_fallback_failure_message(
+    encoder: &HardwareEncoder,
+    hardware_error: &str,
+    software_error: &str,
+) -> String {
+    format!(
+        "Preferred encoder {:?} failed: {}; software fallback failed: {}",
+        encoder, hardware_error, software_error
+    )
+}
+
 async fn transcode_to_cache_once(
     media_dir: &PathBuf,
     filename: &str,
@@ -830,13 +1213,21 @@ async fn transcode_to_cache_once(
         || async {
             match transcode_to_cache(media_dir, filename, encoder).await {
                 Ok(path) => Ok(path),
-                Err(e) if !matches!(encoder, HardwareEncoder::None) => {
+                Err(hardware_error) if should_fallback_to_software(encoder) => {
                     log::warn!(
                         "Preferred encoder {:?} failed, falling back to software: {}",
                         encoder,
-                        e
+                        hardware_error
                     );
-                    transcode_to_cache(media_dir, filename, &HardwareEncoder::None).await
+                    transcode_to_cache(media_dir, filename, &HardwareEncoder::None)
+                        .await
+                        .map_err(|software_error| {
+                            software_fallback_failure_message(
+                                encoder,
+                                &hardware_error,
+                                &software_error,
+                            )
+                        })
                 }
                 Err(e) => Err(e),
             }
@@ -1148,13 +1539,22 @@ async fn stream_media(
     }
 }
 
+fn remove_media_cache_files(media_dir: &PathBuf, filename: &str) {
+    for profile in [CacheProfile::RemuxTs, CacheProfile::TranscodedH264Aac] {
+        let cache_path = get_cache_path(media_dir, filename, profile);
+        let _ = std::fs::remove_file(cache_path);
+    }
+}
+
+async fn remove_upload_temp_file(path: &FilePath) {
+    let _ = tokio::fs::remove_file(path).await;
+}
+
 /// POST /api/media/upload
 async fn upload_media(
     State(app): State<WebAppState>,
     mut multipart: Multipart,
-) -> Result<StatusCode, ApiError> {
-    const ALLOWED_EXTENSIONS: &[&str] = &["mp4", "webm", "avi", "mkv", "mov"];
-
+) -> Result<Json<UploadMediaResponse>, ApiError> {
     while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         error_response(
             StatusCode::BAD_REQUEST,
@@ -1169,56 +1569,74 @@ async fn upload_media(
                 .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "No filename provided"))?
                 .to_string();
 
-            validate_media_filename(&filename)?;
+            validate_media_upload_filename(&filename)?;
 
-            let ext = filename
-                .rsplit('.')
-                .next()
-                .map(|e| e.to_lowercase())
-                .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "No file extension"))?;
-
-            if !ALLOWED_EXTENSIONS.contains(&ext.as_str()) {
+            let dest_path = app.media_dir.join(&filename);
+            if dest_path.exists() {
                 return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "Invalid file extension '{}'. Allowed: {:?}",
-                        ext, ALLOWED_EXTENSIONS
-                    ),
+                    StatusCode::CONFLICT,
+                    format!("Media file already exists: {}", filename),
                 ));
             }
 
-            let dest_path = app.media_dir.join(&filename);
+            let temp_path = app
+                .media_dir
+                .join(format!(".uploading-{}.tmp", Uuid::new_v4().simple()));
 
             use tokio::io::AsyncWriteExt;
-            let mut file = tokio::fs::File::create(&dest_path).await.map_err(|e| {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create file: {}", e),
-                )
-            })?;
-
-            while let Some(chunk) = field.chunk().await.map_err(|e| {
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to read file: {}", e),
-                )
-            })? {
-                file.write_all(&chunk).await.map_err(|e| {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .await
+                .map_err(|e| {
                     error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to write file: {}", e),
+                        format!("Failed to create upload temp file: {}", e),
                     )
                 })?;
+
+            while let Some(chunk) = match field.chunk().await {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    remove_upload_temp_file(&temp_path).await;
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read file: {}", e),
+                    ));
+                }
+            } {
+                if let Err(e) = file.write_all(&chunk).await {
+                    remove_upload_temp_file(&temp_path).await;
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to write file: {}", e),
+                    ));
+                }
             }
 
-            file.flush().await.map_err(|e| {
-                error_response(
+            if let Err(e) = file.flush().await {
+                remove_upload_temp_file(&temp_path).await;
+                return Err(error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to flush file: {}", e),
-                )
-            })?;
+                ));
+            }
 
-            return Ok(StatusCode::OK);
+            drop(file);
+
+            tokio::fs::rename(&temp_path, &dest_path)
+                .await
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&temp_path);
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to move upload into place: {}", e),
+                    )
+                })?;
+
+            let file = media_file_info(&app.media_dir, &filename)?;
+            return Ok(Json(UploadMediaResponse { file }));
         }
     }
 
@@ -1226,6 +1644,95 @@ async fn upload_media(
         StatusCode::BAD_REQUEST,
         "No file field in multipart form",
     ))
+}
+
+async fn delete_media_file(
+    State(app): State<WebAppState>,
+    Path(filename): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    validate_media_upload_filename(&filename)?;
+
+    let path = app.media_dir.join(&filename);
+    if !path.exists() {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Media file not found",
+        ));
+    }
+
+    tokio::fs::remove_file(&path).await.map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete media file: {}", e),
+        )
+    })?;
+    remove_media_cache_files(&app.media_dir, &filename);
+
+    let mut st = app.shared.write().await;
+    for device in &mut st.devices {
+        if device.current_media.as_deref() == Some(&filename) {
+            device.current_media = None;
+        }
+    }
+    for scene in &mut st.scenes {
+        scene.assignments.retain(|_, media| media != &filename);
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn rename_media_file(
+    State(app): State<WebAppState>,
+    Path(filename): Path<String>,
+    Json(body): Json<RenameMediaRequest>,
+) -> Result<Json<MediaFileInfo>, ApiError> {
+    validate_media_upload_filename(&filename)?;
+    validate_media_upload_filename(&body.new_name)?;
+
+    if filename == body.new_name {
+        return Ok(Json(media_file_info(&app.media_dir, &filename)?));
+    }
+
+    let old_path = app.media_dir.join(&filename);
+    let new_path = app.media_dir.join(&body.new_name);
+    if !old_path.exists() {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Media file not found",
+        ));
+    }
+    if new_path.exists() {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            format!("Media file already exists: {}", body.new_name),
+        ));
+    }
+
+    tokio::fs::rename(&old_path, &new_path).await.map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to rename media file: {}", e),
+        )
+    })?;
+    remove_media_cache_files(&app.media_dir, &filename);
+    remove_media_cache_files(&app.media_dir, &body.new_name);
+
+    let mut st = app.shared.write().await;
+    for device in &mut st.devices {
+        if device.current_media.as_deref() == Some(&filename) {
+            device.current_media = Some(body.new_name.clone());
+        }
+    }
+    for scene in &mut st.scenes {
+        for media in scene.assignments.values_mut() {
+            if media == &filename {
+                *media = body.new_name.clone();
+            }
+        }
+    }
+    drop(st);
+
+    Ok(Json(media_file_info(&app.media_dir, &body.new_name)?))
 }
 
 /// GET /api/scenes — return the list of defined scenes.
@@ -1457,6 +1964,17 @@ async fn main() {
         .init();
 
     let media_dir = resolve_media_dir();
+    let loaded_config = config::load_or_create_config(generate_secret())
+        .unwrap_or_else(|e| panic!("Failed to load ScreenPilot config: {}", e));
+
+    if loaded_config.created {
+        log::warn!(
+            "Created default config at {:?}. The generated web UI password is stored in this TOML file.",
+            loaded_config.path
+        );
+    } else {
+        log::info!("Loaded config from {:?}", loaded_config.path);
+    }
 
     let local_ip = media_server::local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
     let media_base_url = format!("http://{}:8080", local_ip);
@@ -1513,6 +2031,7 @@ async fn main() {
         client: Arc::new(Mutex::new(Client::new())),
         media_dir: media_dir.clone(),
         cached_encoders: Arc::new(Mutex::new(None)),
+        auth: Arc::new(AuthState::from_config(loaded_config.config.auth)),
     };
 
     // CORS — allow the Vue dev server and any other origin
@@ -1521,9 +2040,14 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let auth_middleware_state = app_state.clone();
     let app = Router::new()
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/logout", post(logout))
+        .route("/api/auth/status", get(auth_status))
         .route("/api/devices", get(get_devices))
         .route("/api/devices/discover", post(discover_devices))
+        .route("/api/devices/:uuid/alias", put(set_device_alias))
         .route("/api/devices/:uuid/play", post(play_on_device))
         .route("/api/devices/:uuid/pause", post(pause_device))
         .route("/api/devices/:uuid/stop", post(stop_device))
@@ -1532,9 +2056,12 @@ async fn main() {
             get(get_device_loop).put(set_device_loop),
         )
         .route("/api/media", get(list_media))
+        .route("/api/media/files", get(list_media_files))
+        .route("/api/media/files/:filename", delete(delete_media_file))
+        .route("/api/media/files/:filename/rename", put(rename_media_file))
         .route(
             "/api/media/upload",
-            post(upload_media).layer(DefaultBodyLimit::max(100 * 1024 * 1024 * 1024)),
+            post(upload_media).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .route("/api/media/stream/*path", get(stream_media))
         .route("/api/scenes", get(get_scenes).post(save_scene))
@@ -1548,13 +2075,16 @@ async fn main() {
             "/api/config/loop-playback",
             get(get_loop_playback).put(set_loop_playback),
         )
-        .nest_service("/media", ServeDir::new(media_dir.clone()))
         .route("/web/assets/*path", get(serve_assets))
         .route("/web/favicon.ico", get(serve_favicon))
         .route("/web", get(serve_frontend))
         .route("/web/", get(serve_frontend))
         .fallback(get(serve_frontend))
         .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            auth_middleware_state,
+            require_auth,
+        ))
         .with_state(app_state);
 
     let (listener, port) = bind_with_fallback(8080).await;
@@ -1595,6 +2125,79 @@ async fn bind_with_fallback(port: u16) -> (tokio::net::TcpListener, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_auth_state_issues_and_revokes_session() {
+        let auth = AuthState::from_config(config::AuthSettings {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+        });
+
+        assert!(auth.verify_credentials("admin", "secret"));
+        assert!(!auth.verify_credentials("admin", "wrong"));
+
+        let token = auth.issue_session_token();
+        assert!(auth.verify_session_token(&token));
+
+        auth.revoke_session_token(&token);
+        assert!(!auth.verify_session_token(&token));
+    }
+
+    #[test]
+    fn test_session_token_from_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("theme=dark; screenpilot_session=abc123; other=value"),
+        );
+
+        assert_eq!(session_token_from_headers(&headers), Some("abc123"));
+    }
+
+    #[test]
+    fn test_normalize_device_alias_trims_and_clears_empty() {
+        assert_eq!(
+            normalize_device_alias(Some("  Lobby Screen  ".to_string())).unwrap(),
+            Some("Lobby Screen".to_string())
+        );
+        assert_eq!(
+            normalize_device_alias(Some("   ".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(normalize_device_alias(None).unwrap(), None);
+    }
+
+    #[test]
+    fn test_normalize_device_alias_rejects_too_long() {
+        let alias = "a".repeat(MAX_DEVICE_ALIAS_CHARS + 1);
+        let result = normalize_device_alias(Some(alias));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_media_upload_filename() {
+        assert_eq!(
+            validate_media_upload_filename("promo.mp4").unwrap(),
+            "mp4".to_string()
+        );
+        assert!(validate_media_upload_filename(".hidden.mp4").is_err());
+        assert!(validate_media_upload_filename("promo.txt").is_err());
+        assert!(validate_media_upload_filename("nested/promo.mp4").is_err());
+    }
+
+    #[test]
+    fn test_media_file_info_includes_size_and_extension() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let media_dir = temp_dir.path().to_path_buf();
+        std::fs::write(media_dir.join("promo.mp4"), b"hello").unwrap();
+
+        let info = media_file_info(&media_dir, "promo.mp4").unwrap();
+
+        assert_eq!(info.name, "promo.mp4");
+        assert_eq!(info.size, 5);
+        assert_eq!(info.extension, "mp4");
+        assert!(info.modified.is_some());
+    }
 
     #[test]
     fn test_get_cache_dir() {
@@ -1675,11 +2278,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         std::fs::write(media_dir.join("original.mp4"), b"newer").unwrap();
 
-        let result = check_cache(
-            &media_dir,
-            "original.mp4",
-            CacheProfile::TranscodedH264Aac,
-        );
+        let result = check_cache(&media_dir, "original.mp4", CacheProfile::TranscodedH264Aac);
         assert!(result.is_none());
 
         drop(temp_dir);
@@ -1702,11 +2301,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = check_cache(
-            &media_dir,
-            "original.mp4",
-            CacheProfile::TranscodedH264Aac,
-        );
+        let result = check_cache(&media_dir, "original.mp4", CacheProfile::TranscodedH264Aac);
         assert!(result.is_some());
         assert!(result.unwrap().to_string_lossy().contains(".cache"));
 
@@ -1877,5 +2472,29 @@ mod tests {
             get_encoder_from_preference("vaapi"),
             HardwareEncoder::Vaapi
         ));
+    }
+
+    #[test]
+    fn test_should_fallback_to_software_for_hardware_encoders() {
+        assert!(!should_fallback_to_software(&HardwareEncoder::None));
+        assert!(should_fallback_to_software(&HardwareEncoder::Nvidia));
+        assert!(should_fallback_to_software(&HardwareEncoder::AmdVce));
+        assert!(should_fallback_to_software(&HardwareEncoder::IntelQsv));
+        assert!(should_fallback_to_software(&HardwareEncoder::AppleVtb));
+        assert!(should_fallback_to_software(&HardwareEncoder::Vaapi));
+    }
+
+    #[test]
+    fn test_software_fallback_failure_message_includes_both_errors() {
+        let message = software_fallback_failure_message(
+            &HardwareEncoder::Nvidia,
+            "nvenc initialization failed",
+            "libx264 failed",
+        );
+
+        assert!(message.contains("Nvidia"));
+        assert!(message.contains("nvenc initialization failed"));
+        assert!(message.contains("software fallback failed"));
+        assert!(message.contains("libx264 failed"));
     }
 }

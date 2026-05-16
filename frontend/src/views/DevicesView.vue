@@ -1,39 +1,17 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { EditPen } from '@element-plus/icons-vue'
 import { useAppStore } from '@/stores/app'
 import * as api from '@/api'
+import type { RendererDevice } from '@/types'
 
 const store = useAppStore()
 const selectedMedia = ref<Record<string, string>>({})
-const uploading = ref(false)
-const fileInput = ref<HTMLInputElement | null>(null)
 
 onMounted(async () => {
   await store.loadEncoder()
 })
-
-async function triggerUpload() {
-  fileInput.value?.click()
-}
-
-async function handleFileChange(event: Event) {
-  const target = event.target as HTMLInputElement
-  const file = target.files?.[0]
-  if (!file) return
-
-  uploading.value = true
-  try {
-    await api.uploadMedia(file)
-    ElMessage.success(`Uploaded "${file.name}"`)
-    await store.loadMediaFiles()
-  } catch (e: any) {
-    ElMessage.error(`Upload failed: ${e.message}`)
-  } finally {
-    uploading.value = false
-    target.value = ''
-  }
-}
 
 function statusType(status: string): '' | 'success' | 'warning' | 'info' | 'danger' {
   switch (status) {
@@ -43,6 +21,10 @@ function statusType(status: string): '' | 'success' | 'warning' | 'info' | 'dang
     case 'error': return 'danger'
     default: return 'info'
   }
+}
+
+function deviceDisplayName(device: RendererDevice): string {
+  return device.alias?.trim() || device.name
 }
 
 async function play(uuid: string) {
@@ -57,6 +39,26 @@ async function play(uuid: string) {
     await store.loadDevices()
   } catch (e: any) {
     ElMessage.error(`Play failed: ${e.message}`)
+  }
+}
+
+async function editAlias(device: RendererDevice) {
+  try {
+    const { value } = await ElMessageBox.prompt('', 'Device Alias', {
+      confirmButtonText: 'Save',
+      cancelButtonText: 'Cancel',
+      inputValue: device.alias ?? '',
+      inputPlaceholder: device.name,
+      inputValidator: (value: string) =>
+        value.trim().length <= 64 || 'Alias must be 64 characters or fewer',
+    })
+    const alias = value.trim()
+    await store.setDeviceAlias(device.uuid, alias || null)
+    ElMessage.success(alias ? 'Alias saved' : 'Alias cleared')
+  } catch (e: any) {
+    if (e !== 'cancel' && e !== 'close') {
+      ElMessage.error(`Alias update failed: ${e.message ?? e}`)
+    }
   }
 }
 
@@ -118,21 +120,6 @@ async function toggleLoop(uuid: string, loop: boolean) {
         <el-option label="Software (CPU)" value="software" />
       </el-select>
 
-      <input
-        ref="fileInput"
-        type="file"
-        accept=".mp4,.webm,.avi,.mkv,.mov"
-        style="display: none"
-        @change="handleFileChange"
-      >
-      <el-button 
-        type="primary" 
-        :loading="uploading" 
-        class="upload-btn touch-target"
-        @click="triggerUpload"
-      >
-        {{ uploading ? 'Uploading...' : '📤 Upload' }}
-      </el-button>
     </div>
 
     <el-empty v-if="store.devices.length === 0" description="No devices found. Click Discover Devices to scan the network." />
@@ -143,8 +130,23 @@ async function toggleLoop(uuid: string, loop: boolean) {
           <template #header>
             <div class="device-header">
               <div class="device-info">
-                <strong class="device-name">{{ device.name }}</strong>
-                <div class="device-ip">{{ device.ip }}</div>
+                <div class="device-title-row">
+                  <strong class="device-name">{{ deviceDisplayName(device) }}</strong>
+                  <el-tooltip content="Edit alias" placement="top">
+                    <el-button
+                      :icon="EditPen"
+                      circle
+                      text
+                      size="small"
+                      aria-label="Edit device alias"
+                      @click="editAlias(device)"
+                    />
+                  </el-tooltip>
+                </div>
+                <div class="device-meta">
+                  <span v-if="device.alias" class="device-original">{{ device.name }}</span>
+                  <span>{{ device.ip }}</span>
+                </div>
               </div>
               <el-tag :type="statusType(device.status)" size="small">
                 {{ device.status.toUpperCase() }}
@@ -217,11 +219,6 @@ async function toggleLoop(uuid: string, loop: boolean) {
   min-width: 140px;
 }
 
-.upload-btn {
-  flex: 1;
-  min-width: 140px;
-}
-
 .device-card {
   height: 100%;
   display: flex;
@@ -240,16 +237,35 @@ async function toggleLoop(uuid: string, loop: boolean) {
   flex: 1;
 }
 
+.device-title-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
 .device-name {
   display: block;
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.device-ip {
+.device-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
   font-size: 12px;
   color: var(--el-text-color-secondary);
+}
+
+.device-original {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .now-playing {

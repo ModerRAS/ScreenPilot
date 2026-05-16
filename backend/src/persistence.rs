@@ -114,6 +114,7 @@ mod tests {
             RendererDevice {
                 uuid: "test-uuid-1".to_string(),
                 name: "Test Device 1".to_string(),
+                alias: Some("Lobby".to_string()),
                 ip: "192.168.1.100".to_string(),
                 av_transport_url: "http://192.168.1.100:49152/upnp/control/AVTransport".to_string(),
                 status: crate::state::PlaybackStatus::Idle,
@@ -123,6 +124,7 @@ mod tests {
             RendererDevice {
                 uuid: "test-uuid-2".to_string(),
                 name: "Test Device 2".to_string(),
+                alias: None,
                 ip: "192.168.1.101".to_string(),
                 av_transport_url: "http://192.168.1.101:49152/upnp/control/AVTransport".to_string(),
                 status: crate::state::PlaybackStatus::Playing,
@@ -139,6 +141,7 @@ mod tests {
         let loaded = load_devices();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].uuid, "test-uuid-1");
+        assert_eq!(loaded[0].alias, Some("Lobby".to_string()));
         assert_eq!(loaded[1].uuid, "test-uuid-2");
         assert_eq!(loaded[1].status, crate::state::PlaybackStatus::Playing);
 
@@ -152,6 +155,7 @@ mod tests {
         let test_devices = vec![RendererDevice {
             uuid: "test".to_string(),
             name: "Test".to_string(),
+            alias: None,
             ip: "192.168.1.1".to_string(),
             av_transport_url: "http://192.168.1.1:8000".to_string(),
             status: crate::state::PlaybackStatus::Idle,

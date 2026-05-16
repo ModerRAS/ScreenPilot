@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAppStore } from '@/stores/app'
 import * as api from '@/api'
-import type { Scene } from '@/types'
+import type { RendererDevice, Scene } from '@/types'
 
 const store = useAppStore()
 
@@ -31,7 +31,11 @@ function hideEditor() {
 
 function deviceName(uuid: string): string {
   const dev = store.devices.find(d => d.uuid === uuid)
-  return dev ? dev.name : uuid.slice(0, 8) + '…'
+  return dev ? deviceDisplayName(dev) : uuid.slice(0, 8) + '…'
+}
+
+function deviceDisplayName(device: RendererDevice): string {
+  return device.alias?.trim() || device.name
 }
 
 async function save() {
@@ -127,7 +131,7 @@ async function apply(name: string) {
             No devices discovered yet. Run discovery first.
           </div>
 
-          <el-form-item v-for="device in store.devices" :key="device.uuid" :label="device.name">
+          <el-form-item v-for="device in store.devices" :key="device.uuid" :label="deviceDisplayName(device)">
             <el-select
               v-model="sceneAssignments[device.uuid]"
               placeholder="— none —"

@@ -223,6 +223,7 @@ async fn fetch_device_description_once(
     Ok(RendererDevice {
         uuid,
         name,
+        alias: None,
         ip,
         av_transport_url,
         status: crate::state::PlaybackStatus::Idle,

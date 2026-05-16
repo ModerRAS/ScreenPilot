@@ -1,5 +1,12 @@
 import axios from 'axios'
-import type { RendererDevice, Scene, SceneApplyResult } from '@/types'
+import type {
+  AuthStatus,
+  MediaFileInfo,
+  RendererDevice,
+  Scene,
+  SceneApplyResult,
+  UploadMediaResponse,
+} from '@/types'
 
 const api = axios.create({
   baseURL: '/api',
@@ -8,6 +15,21 @@ const api = axios.create({
 
 export async function getDevices(): Promise<RendererDevice[]> {
   const { data } = await api.get<RendererDevice[]>('/devices')
+  return data
+}
+
+export async function login(username: string, password: string): Promise<AuthStatus> {
+  const { data } = await api.post<AuthStatus>('/auth/login', { username, password })
+  return data
+}
+
+export async function logout(): Promise<AuthStatus> {
+  const { data } = await api.post<AuthStatus>('/auth/logout')
+  return data
+}
+
+export async function getAuthStatus(): Promise<AuthStatus> {
+  const { data } = await api.get<AuthStatus>('/auth/status')
   return data
 }
 
@@ -28,15 +50,51 @@ export async function stopDevice(uuid: string): Promise<void> {
   await api.post(`/devices/${encodeURIComponent(uuid)}/stop`)
 }
 
+export async function setDeviceAlias(uuid: string, alias: string | null): Promise<RendererDevice> {
+  const { data } = await api.put<RendererDevice>(`/devices/${encodeURIComponent(uuid)}/alias`, { alias })
+  return data
+}
+
 export async function listMedia(): Promise<string[]> {
   const { data } = await api.get<string[]>('/media')
   return data
 }
 
-export async function uploadMedia(file: File): Promise<void> {
+export async function listMediaFiles(): Promise<MediaFileInfo[]> {
+  const { data } = await api.get<MediaFileInfo[]>('/media/files')
+  return data
+}
+
+export async function uploadMedia(
+  file: File,
+  onProgress?: (progress: { loaded: number; total: number | null; percent: number | null }) => void,
+): Promise<UploadMediaResponse> {
   const formData = new FormData()
   formData.append('file', file)
-  await api.post('/media/upload', formData)
+  const { data } = await api.post<UploadMediaResponse>('/media/upload', formData, {
+    timeout: 0,
+    onUploadProgress: event => {
+      const total = event.total ?? null
+      onProgress?.({
+        loaded: event.loaded,
+        total,
+        percent: total ? Math.round((event.loaded / total) * 100) : null,
+      })
+    },
+  })
+  return data
+}
+
+export async function deleteMediaFile(filename: string): Promise<void> {
+  await api.delete(`/media/files/${encodeURIComponent(filename)}`)
+}
+
+export async function renameMediaFile(filename: string, newName: string): Promise<MediaFileInfo> {
+  const { data } = await api.put<MediaFileInfo>(
+    `/media/files/${encodeURIComponent(filename)}/rename`,
+    { new_name: newName },
+  )
+  return data
 }
 
 export async function getScenes(): Promise<Scene[]> {

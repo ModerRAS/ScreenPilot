@@ -31,5 +31,6 @@ frontend/dist/
 *.log
 
 /media
+data/
 
 network.json
