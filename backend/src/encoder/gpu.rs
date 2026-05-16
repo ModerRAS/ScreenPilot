@@ -7,6 +7,59 @@
 
 use super::{EncoderBackend, HwEncoder, VideoCodec};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuVendor {
+    Nvidia,
+    Intel,
+    Amd,
+}
+
+pub fn detect_gpu_vendors() -> Vec<GpuVendor> {
+    let mut vendors = Vec::new();
+
+    if match std::env::consts::OS {
+        "windows" => check_nvidia_windows(),
+        "linux" => check_nvidia_linux(),
+        _ => false,
+    } {
+        vendors.push(GpuVendor::Nvidia);
+    }
+
+    if match std::env::consts::OS {
+        "windows" => check_intel_windows(),
+        "linux" => check_intel_linux(),
+        _ => false,
+    } {
+        vendors.push(GpuVendor::Intel);
+    }
+
+    if match std::env::consts::OS {
+        "windows" => check_amd_windows(),
+        "linux" => check_amd_linux(),
+        _ => false,
+    } {
+        vendors.push(GpuVendor::Amd);
+    }
+
+    vendors
+}
+
+pub fn backend_matches_detected_gpu(backend: EncoderBackend, vendors: &[GpuVendor]) -> bool {
+    match backend {
+        EncoderBackend::Nvenc => vendors.contains(&GpuVendor::Nvidia),
+        EncoderBackend::Qsv => vendors.contains(&GpuVendor::Intel),
+        EncoderBackend::Amf => vendors.contains(&GpuVendor::Amd),
+        EncoderBackend::Vaapi => {
+            vendors.contains(&GpuVendor::Intel)
+                || vendors.contains(&GpuVendor::Amd)
+                || vendors.contains(&GpuVendor::Nvidia)
+        }
+        EncoderBackend::Videotoolbox => cfg!(target_os = "macos"),
+        EncoderBackend::Mf => cfg!(target_os = "windows"),
+        EncoderBackend::Software => true,
+    }
+}
+
 /// Detect hardware encoders via GPU vendor APIs (L1).
 ///
 /// Returns a list of detected hardware encoders with priority=1 (highest).
@@ -15,8 +68,10 @@ pub fn detect_gpu_encoders() -> anyhow::Result<Vec<HwEncoder>> {
 
     log::info!("[encoder] L1: probing GPU vendor APIs...");
 
-    // Detect NVIDIA
-    if let Some(nvidia_encoders) = detect_nvidia() {
+    let vendors = detect_gpu_vendors();
+
+    if vendors.contains(&GpuVendor::Nvidia) {
+        let nvidia_encoders = nvidia_encoders();
         log::info!(
             "[encoder] L1: NVIDIA GPU detected, adding {} encoders",
             nvidia_encoders.len()
@@ -24,8 +79,8 @@ pub fn detect_gpu_encoders() -> anyhow::Result<Vec<HwEncoder>> {
         encoders.extend(nvidia_encoders);
     }
 
-    // Detect Intel
-    if let Some(intel_encoders) = detect_intel() {
+    if vendors.contains(&GpuVendor::Intel) {
+        let intel_encoders = intel_encoders();
         log::info!(
             "[encoder] L1: Intel GPU detected, adding {} encoders",
             intel_encoders.len()
@@ -33,8 +88,8 @@ pub fn detect_gpu_encoders() -> anyhow::Result<Vec<HwEncoder>> {
         encoders.extend(intel_encoders);
     }
 
-    // Detect AMD
-    if let Some(amd_encoders) = detect_amd() {
+    if vendors.contains(&GpuVendor::Amd) {
+        let amd_encoders = amd_encoders();
         log::info!(
             "[encoder] L1: AMD GPU detected, adding {} encoders",
             amd_encoders.len()
@@ -49,65 +104,36 @@ pub fn detect_gpu_encoders() -> anyhow::Result<Vec<HwEncoder>> {
     Ok(encoders)
 }
 
-/// Detect NVIDIA GPU and return available encoders.
-fn detect_nvidia() -> Option<Vec<HwEncoder>> {
-    let has_nvidia = match std::env::consts::OS {
-        "windows" => check_nvidia_windows(),
-        "linux" => check_nvidia_linux(),
-        _ => false,
-    };
-
-    if has_nvidia {
-        Some(vec![
-            HwEncoder {
-                codec: VideoCodec::H264,
-                backend: EncoderBackend::Nvenc,
-                device: get_nvidia_device_name(),
-                priority: 1,
-                ffmpeg_name: "h264_nvenc".to_string(),
-            },
-            HwEncoder {
-                codec: VideoCodec::Hevc,
-                backend: EncoderBackend::Nvenc,
-                device: get_nvidia_device_name(),
-                priority: 1,
-                ffmpeg_name: "hevc_nvenc".to_string(),
-            },
-            HwEncoder {
-                codec: VideoCodec::Av1,
-                backend: EncoderBackend::Nvenc,
-                device: get_nvidia_device_name(),
-                priority: 1,
-                ffmpeg_name: "av1_nvenc".to_string(),
-            },
-        ])
-    } else {
-        None
-    }
+fn nvidia_encoders() -> Vec<HwEncoder> {
+    vec![
+        HwEncoder {
+            codec: VideoCodec::H264,
+            backend: EncoderBackend::Nvenc,
+            device: get_nvidia_device_name(),
+            priority: 1,
+            ffmpeg_name: "h264_nvenc".to_string(),
+        },
+        HwEncoder {
+            codec: VideoCodec::Hevc,
+            backend: EncoderBackend::Nvenc,
+            device: get_nvidia_device_name(),
+            priority: 1,
+            ffmpeg_name: "hevc_nvenc".to_string(),
+        },
+        HwEncoder {
+            codec: VideoCodec::Av1,
+            backend: EncoderBackend::Nvenc,
+            device: get_nvidia_device_name(),
+            priority: 1,
+            ffmpeg_name: "av1_nvenc".to_string(),
+        },
+    ]
 }
 
 /// Check for NVIDIA GPU on Windows via registry.
 #[cfg(target_os = "windows")]
 fn check_nvidia_windows() -> bool {
-    use std::process::Command;
-
-    // Check registry for NVIDIA GPU
-    let output = Command::new("reg")
-        .args([
-            "query",
-            r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
-            "/v",
-            "DriverDesc",
-        ])
-        .output();
-
-    match output {
-        Ok(result) => {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            stdout.contains("NVIDIA") || stdout.contains("nvidia")
-        }
-        Err(_) => false,
-    }
+    windows_gpu_name_matches(&["nvidia"])
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -169,57 +195,29 @@ fn get_nvidia_smi_name() -> Option<String> {
         })
 }
 
-/// Detect Intel GPU and return available encoders.
-fn detect_intel() -> Option<Vec<HwEncoder>> {
-    let has_intel = match std::env::consts::OS {
-        "windows" => check_intel_windows(),
-        "linux" => check_intel_linux(),
-        _ => false,
-    };
-
-    if has_intel {
-        Some(vec![
-            HwEncoder {
-                codec: VideoCodec::H264,
-                backend: EncoderBackend::Qsv,
-                device: get_intel_device_name(),
-                priority: 1,
-                ffmpeg_name: "h264_qsv".to_string(),
-            },
-            HwEncoder {
-                codec: VideoCodec::Hevc,
-                backend: EncoderBackend::Qsv,
-                device: get_intel_device_name(),
-                priority: 1,
-                ffmpeg_name: "hevc_qsv".to_string(),
-            },
-        ])
-    } else {
-        None
-    }
+fn intel_encoders() -> Vec<HwEncoder> {
+    vec![
+        HwEncoder {
+            codec: VideoCodec::H264,
+            backend: EncoderBackend::Qsv,
+            device: get_intel_device_name(),
+            priority: 1,
+            ffmpeg_name: "h264_qsv".to_string(),
+        },
+        HwEncoder {
+            codec: VideoCodec::Hevc,
+            backend: EncoderBackend::Qsv,
+            device: get_intel_device_name(),
+            priority: 1,
+            ffmpeg_name: "hevc_qsv".to_string(),
+        },
+    ]
 }
 
 /// Check for Intel GPU on Windows via registry.
 #[cfg(target_os = "windows")]
 fn check_intel_windows() -> bool {
-    use std::process::Command;
-
-    let output = Command::new("reg")
-        .args([
-            "query",
-            r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
-            "/v",
-            "DriverDesc",
-        ])
-        .output();
-
-    match output {
-        Ok(result) => {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            stdout.contains("Intel") || stdout.contains("intel")
-        }
-        Err(_) => false,
-    }
+    windows_gpu_name_matches(&["intel"])
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -232,23 +230,8 @@ fn check_intel_windows() -> bool {
 fn check_intel_linux() -> bool {
     use std::path::Path;
 
-    // Check /sys/class/drm for Intel GPUs
-    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
-        for entry in entries.flatten() {
-            if let Ok(name) = entry.file_name().into_string() {
-                if name.starts_with("card") && !name.contains("-") {
-                    let device_path = entry.path().join("device");
-                    if device_path.exists() {
-                        if let Ok(vendor) = std::fs::read_to_string(device_path.join("vendor")) {
-                            // Intel vendor ID is 0x8086
-                            if vendor.trim().contains("0x8086") {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if drm_vendor_exists(Path::new("/sys/class/drm"), "0x8086") {
+        return true;
     }
 
     // Fallback: check lspci
@@ -258,7 +241,7 @@ fn check_intel_linux() -> bool {
         .ok()
         .map(|o| {
             let output = String::from_utf8_lossy(&o.stdout);
-            output.contains("8086") && (output.contains("VGA") || output.contains("Display"))
+            lspci_vendor_has_display(&output, "8086")
         })
         .unwrap_or(false)
 }
@@ -300,59 +283,29 @@ fn get_intel_device_name() -> Option<String> {
     }
 }
 
-/// Detect AMD GPU and return available encoders.
-fn detect_amd() -> Option<Vec<HwEncoder>> {
-    let has_amd = match std::env::consts::OS {
-        "windows" => check_amd_windows(),
-        "linux" => check_amd_linux(),
-        _ => false,
-    };
-
-    if has_amd {
-        Some(vec![
-            HwEncoder {
-                codec: VideoCodec::H264,
-                backend: EncoderBackend::Amf,
-                device: get_amd_device_name(),
-                priority: 1,
-                ffmpeg_name: "h264_amf".to_string(),
-            },
-            HwEncoder {
-                codec: VideoCodec::Hevc,
-                backend: EncoderBackend::Amf,
-                device: get_amd_device_name(),
-                priority: 1,
-                ffmpeg_name: "hevc_amf".to_string(),
-            },
-        ])
-    } else {
-        None
-    }
+fn amd_encoders() -> Vec<HwEncoder> {
+    vec![
+        HwEncoder {
+            codec: VideoCodec::H264,
+            backend: EncoderBackend::Amf,
+            device: get_amd_device_name(),
+            priority: 1,
+            ffmpeg_name: "h264_amf".to_string(),
+        },
+        HwEncoder {
+            codec: VideoCodec::Hevc,
+            backend: EncoderBackend::Amf,
+            device: get_amd_device_name(),
+            priority: 1,
+            ffmpeg_name: "hevc_amf".to_string(),
+        },
+    ]
 }
 
 /// Check for AMD GPU on Windows via registry.
 #[cfg(target_os = "windows")]
 fn check_amd_windows() -> bool {
-    use std::process::Command;
-
-    // Use PowerShell to enumerate all subkeys and check DriverDesc
-    let ps_script = r#"
-        $gpuKeys = Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue
-        foreach ($key in $gpuKeys) {
-            $desc = (Get-ItemProperty $key.PSPath -Name DriverDesc -ErrorAction SilentlyContinue).DriverDesc
-            if ($desc -match 'AMD|Radeon') { exit 0 }
-        }
-        exit 1
-    "#;
-
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", ps_script])
-        .output();
-
-    match output {
-        Ok(result) => result.status.success(),
-        Err(_) => false,
-    }
+    windows_gpu_name_matches(&["amd", "radeon"])
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -363,16 +316,17 @@ fn check_amd_windows() -> bool {
 /// Check for AMD GPU on Linux via /sys/class/drm or lspci.
 #[cfg(target_os = "linux")]
 fn check_amd_linux() -> bool {
-    // Check lspci for AMD GPUs
+    if drm_vendor_exists(std::path::Path::new("/sys/class/drm"), "0x1002") {
+        return true;
+    }
+
     std::process::Command::new("lspci")
         .arg("-n")
         .output()
         .ok()
         .map(|o| {
             let output = String::from_utf8_lossy(&o.stdout);
-            // AMD vendor IDs: 0x1002 (old), 0x1022 (new)
-            (output.contains("1002") || output.contains("1022"))
-                && (output.contains("VGA") || output.contains("Display"))
+            lspci_vendor_has_display(&output, "1002")
         })
         .unwrap_or(false)
 }
@@ -416,6 +370,57 @@ fn get_amd_device_name() -> Option<String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn windows_gpu_name_matches(needles: &[&str]) -> bool {
+    use std::process::Command;
+
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }",
+        ])
+        .output();
+
+    output
+        .ok()
+        .filter(|result| result.status.success())
+        .map(|result| {
+            let stdout = String::from_utf8_lossy(&result.stdout).to_lowercase();
+            needles.iter().any(|needle| stdout.contains(needle))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn drm_vendor_exists(drm_root: &std::path::Path, vendor_id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(drm_root) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("card") || name.contains('-') {
+            return false;
+        }
+
+        std::fs::read_to_string(entry.path().join("device/vendor"))
+            .map(|vendor| vendor.trim().eq_ignore_ascii_case(vendor_id))
+            .unwrap_or(false)
+    })
+}
+
+fn lspci_vendor_has_display(output: &str, vendor_id: &str) -> bool {
+    let vendor = vendor_id.trim_start_matches("0x").to_ascii_lowercase();
+
+    output.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        let is_display =
+            lower.contains("vga") || lower.contains("display") || lower.contains("3d controller");
+        is_display && lower.contains(&vendor)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +432,28 @@ mod tests {
         // May or may not have encoders depending on the test environment
         let encoders = result.unwrap();
         log::info!("Detected {} GPU encoders", encoders.len());
+    }
+
+    #[test]
+    fn test_lspci_vendor_has_display_checks_same_line() {
+        let output = "\
+00:02.0 VGA compatible controller [0300]: Intel Corporation Device [8086:a788]
+00:14.0 USB controller [0c03]: Advanced Micro Devices, Inc. [AMD] Device [1022:abcd]
+";
+
+        assert!(lspci_vendor_has_display(output, "8086"));
+        assert!(!lspci_vendor_has_display(output, "1002"));
+    }
+
+    #[test]
+    fn test_backend_matches_detected_gpu() {
+        let vendors = vec![GpuVendor::Intel];
+
+        assert!(backend_matches_detected_gpu(EncoderBackend::Qsv, &vendors));
+        assert!(!backend_matches_detected_gpu(EncoderBackend::Amf, &vendors));
+        assert!(!backend_matches_detected_gpu(
+            EncoderBackend::Nvenc,
+            &vendors
+        ));
     }
 }

@@ -195,6 +195,7 @@ fn detect_linux_vaapi() -> anyhow::Result<Vec<HwEncoder>> {
 
     if !has_render_device {
         log::info!("[encoder] L2: no /dev/dri/renderD* devices found, VAAPI may not be available");
+        return Ok(encoders);
     }
 
     let output = Command::new("ffmpeg")
@@ -296,7 +297,7 @@ fn detect_linux_vaapi() -> anyhow::Result<Vec<HwEncoder>> {
 #[cfg(target_os = "linux")]
 fn check_dri_render_device() -> bool {
     use std::path::Path;
-    
+
     let render_path = Path::new("/dev/dri");
 
     if !render_path.exists() {
@@ -319,7 +320,7 @@ fn check_dri_render_device() -> bool {
 #[cfg(target_os = "linux")]
 fn detect_vaapi_device_name() -> Option<String> {
     use std::path::Path;
-    
+
     let sys_drm = Path::new("/sys/class/drm");
 
     if let Ok(entries) = std::fs::read_dir(sys_drm) {

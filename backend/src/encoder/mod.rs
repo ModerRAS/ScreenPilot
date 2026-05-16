@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Instant;
 
 mod ffmpeg;
@@ -7,7 +8,7 @@ mod os_framework;
 mod runtime_test;
 
 /// Backend type for hardware encoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EncoderBackend {
     /// NVIDIA NVENC
@@ -41,7 +42,7 @@ impl std::fmt::Display for EncoderBackend {
 }
 
 /// Supported video codecs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoCodec {
     H264,
@@ -123,8 +124,11 @@ pub async fn detect_hw_encoders() -> anyhow::Result<DetectionResult> {
         Ok(gpu_encoders) => {
             if !gpu_encoders.is_empty() {
                 sources.push(DetectionSource::L1GpuApi);
-                encoders.extend(gpu_encoders);
-                log::info!("[encoder] L1: GPU detection found {} encoders", encoders.len());
+                encoders.extend(filter_encoders_with_ffmpeg_support(gpu_encoders));
+                log::info!(
+                    "[encoder] L1: GPU detection found {} encoders",
+                    encoders.len()
+                );
             } else {
                 log::info!("[encoder] L1: No hardware encoders found via GPU APIs");
             }
@@ -140,8 +144,11 @@ pub async fn detect_hw_encoders() -> anyhow::Result<DetectionResult> {
         Ok(os_encoders) => {
             if !os_encoders.is_empty() {
                 sources.push(DetectionSource::L2OsFramework);
-                encoders.extend(os_encoders);
-                log::info!("[encoder] L2: OS framework detection found {} encoders", encoders.len());
+                encoders.extend(filter_encoders_with_ffmpeg_support(os_encoders));
+                log::info!(
+                    "[encoder] L2: OS framework detection found {} encoders",
+                    encoders.len()
+                );
             } else {
                 log::info!("[encoder] L2: No hardware encoders found via OS frameworks");
             }
@@ -157,8 +164,11 @@ pub async fn detect_hw_encoders() -> anyhow::Result<DetectionResult> {
         Ok(ffmpeg_encoders) => {
             if !ffmpeg_encoders.is_empty() {
                 sources.push(DetectionSource::L3Ffmpeg);
-                encoders.extend(ffmpeg_encoders);
-                log::info!("[encoder] L3: FFmpeg detection found {} encoders", encoders.len());
+                encoders.extend(filter_ffmpeg_encoders_by_detected_hardware(ffmpeg_encoders));
+                log::info!(
+                    "[encoder] L3: FFmpeg detection found {} encoders",
+                    encoders.len()
+                );
             } else {
                 log::info!("[encoder] L3: No hardware encoders found via FFmpeg");
             }
@@ -173,6 +183,8 @@ pub async fn detect_hw_encoders() -> anyhow::Result<DetectionResult> {
         sources.push(DetectionSource::L4Runtime);
         encoders = runtime_test::validate_encoders_runtime(&encoders).await;
     }
+
+    encoders = dedupe_encoders(encoders);
 
     // TODO: Implement multi-layer detection:
     // - L1: GPU native API detection in gpu.rs
@@ -191,10 +203,7 @@ pub async fn detect_hw_encoders() -> anyhow::Result<DetectionResult> {
     }
 
     // Select primary encoder (highest priority)
-    let primary = encoders
-        .iter()
-        .min_by_key(|e| e.priority)
-        .cloned();
+    let primary = encoders.iter().min_by_key(|e| e.priority).cloned();
 
     if let Some(ref primary) = primary {
         log::info!(
@@ -217,6 +226,110 @@ pub async fn detect_hw_encoders() -> anyhow::Result<DetectionResult> {
         detection_time_ms,
         sources,
     })
+}
+
+pub fn detect_preferred_h264_encoder() -> Option<HwEncoder> {
+    let mut encoders = Vec::new();
+
+    match gpu::detect_gpu_encoders() {
+        Ok(gpu_encoders) => encoders.extend(filter_encoders_with_ffmpeg_support(gpu_encoders)),
+        Err(e) => log::warn!("[encoder] GPU probing failed: {}", e),
+    }
+
+    match os_framework::detect_os_framework_encoders() {
+        Ok(os_encoders) => encoders.extend(filter_encoders_with_ffmpeg_support(os_encoders)),
+        Err(e) => log::warn!("[encoder] OS framework probing failed: {}", e),
+    }
+
+    match ffmpeg::probe_ffmpeg_encoders() {
+        Ok(ffmpeg_encoders) => {
+            encoders.extend(filter_ffmpeg_encoders_by_detected_hardware(ffmpeg_encoders))
+        }
+        Err(e) => log::warn!("[encoder] FFmpeg probing failed: {}", e),
+    }
+
+    choose_primary_encoder(dedupe_encoders(encoders).into_iter().filter(|encoder| {
+        encoder.codec == VideoCodec::H264 && encoder.backend != EncoderBackend::Software
+    }))
+}
+
+fn choose_primary_encoder(encoders: impl IntoIterator<Item = HwEncoder>) -> Option<HwEncoder> {
+    encoders.into_iter().min_by_key(encoder_rank)
+}
+
+fn encoder_rank(encoder: &HwEncoder) -> (u8, u8) {
+    (encoder.priority, backend_rank(encoder.backend))
+}
+
+fn backend_rank(backend: EncoderBackend) -> u8 {
+    match backend {
+        EncoderBackend::Nvenc => 0,
+        EncoderBackend::Qsv => 1,
+        EncoderBackend::Amf => 2,
+        EncoderBackend::Videotoolbox => 3,
+        EncoderBackend::Vaapi => 4,
+        EncoderBackend::Mf => 5,
+        EncoderBackend::Software => 10,
+    }
+}
+
+fn filter_encoders_with_ffmpeg_support(encoders: Vec<HwEncoder>) -> Vec<HwEncoder> {
+    let ffmpeg_encoder_names = ffmpeg::probe_ffmpeg_encoder_names().unwrap_or_else(|e| {
+        log::warn!("[encoder] Could not probe FFmpeg encoder list: {}", e);
+        Vec::new()
+    });
+
+    encoders
+        .into_iter()
+        .filter(|encoder| {
+            ffmpeg::ffmpeg_encoder_name_for_backend(encoder.backend, encoder.codec)
+                .map(|ffmpeg_name| {
+                    if !ffmpeg_encoder_names.iter().any(|name| name == ffmpeg_name) {
+                        log::info!(
+                            "[encoder] Skipping {} because FFmpeg does not provide {}",
+                            encoder.ffmpeg_name,
+                            ffmpeg_name
+                        );
+                        return false;
+                    }
+                    true
+                })
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn filter_ffmpeg_encoders_by_detected_hardware(encoders: Vec<HwEncoder>) -> Vec<HwEncoder> {
+    let vendors = gpu::detect_gpu_vendors();
+
+    encoders
+        .into_iter()
+        .filter(|encoder| {
+            if gpu::backend_matches_detected_gpu(encoder.backend, &vendors) {
+                return true;
+            }
+
+            log::info!(
+                "[encoder] Skipping FFmpeg encoder {} because no matching hardware was detected",
+                encoder.ffmpeg_name
+            );
+            false
+        })
+        .collect()
+}
+
+fn dedupe_encoders(encoders: Vec<HwEncoder>) -> Vec<HwEncoder> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+
+    for encoder in encoders {
+        let key = (encoder.backend, encoder.codec, encoder.ffmpeg_name.clone());
+        if seen.insert(key) {
+            unique.push(encoder);
+        }
+    }
+
+    unique
 }
 
 #[cfg(test)]
@@ -244,5 +357,53 @@ mod tests {
         assert!(!result.encoders.is_empty());
         assert!(result.primary.is_some());
         assert!(result.detection_time_ms > 0);
+    }
+
+    #[test]
+    fn test_choose_primary_encoder_uses_backend_rank_for_ties() {
+        let encoders = vec![
+            HwEncoder {
+                codec: VideoCodec::H264,
+                backend: EncoderBackend::Amf,
+                device: Some("AMD GPU".to_string()),
+                priority: 1,
+                ffmpeg_name: "h264_amf".to_string(),
+            },
+            HwEncoder {
+                codec: VideoCodec::H264,
+                backend: EncoderBackend::Qsv,
+                device: Some("Intel GPU".to_string()),
+                priority: 1,
+                ffmpeg_name: "h264_qsv".to_string(),
+            },
+        ];
+
+        let primary = choose_primary_encoder(encoders).unwrap();
+        assert_eq!(primary.backend, EncoderBackend::Qsv);
+    }
+
+    #[test]
+    fn test_dedupe_encoders_keeps_first_matching_encoder() {
+        let encoders = vec![
+            HwEncoder {
+                codec: VideoCodec::H264,
+                backend: EncoderBackend::Qsv,
+                device: Some("Intel GPU".to_string()),
+                priority: 1,
+                ffmpeg_name: "h264_qsv".to_string(),
+            },
+            HwEncoder {
+                codec: VideoCodec::H264,
+                backend: EncoderBackend::Qsv,
+                device: None,
+                priority: 3,
+                ffmpeg_name: "h264_qsv".to_string(),
+            },
+        ];
+
+        let deduped = dedupe_encoders(encoders);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].priority, 1);
+        assert_eq!(deduped[0].device.as_deref(), Some("Intel GPU"));
     }
 }

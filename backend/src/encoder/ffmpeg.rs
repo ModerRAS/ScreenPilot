@@ -148,6 +148,60 @@ fn map_ffmpeg_encoder(info: &FfmpegEncoderInfo) -> Option<HwEncoder> {
     })
 }
 
+pub fn ffmpeg_encoder_name_for_backend(
+    backend: EncoderBackend,
+    codec: VideoCodec,
+) -> Option<&'static str> {
+    match (backend, codec) {
+        (EncoderBackend::Nvenc, VideoCodec::H264) => Some("h264_nvenc"),
+        (EncoderBackend::Nvenc, VideoCodec::Hevc) => Some("hevc_nvenc"),
+        (EncoderBackend::Nvenc, VideoCodec::Av1) => Some("av1_nvenc"),
+        (EncoderBackend::Qsv, VideoCodec::H264) => Some("h264_qsv"),
+        (EncoderBackend::Qsv, VideoCodec::Hevc) => Some("hevc_qsv"),
+        (EncoderBackend::Qsv, VideoCodec::Av1) => Some("av1_qsv"),
+        (EncoderBackend::Amf, VideoCodec::H264) => Some("h264_amf"),
+        (EncoderBackend::Amf, VideoCodec::Hevc) => Some("hevc_amf"),
+        (EncoderBackend::Amf, VideoCodec::Av1) => Some("av1_amf"),
+        (EncoderBackend::Videotoolbox, VideoCodec::H264) => Some("h264_videotoolbox"),
+        (EncoderBackend::Videotoolbox, VideoCodec::Hevc) => Some("hevc_videotoolbox"),
+        (EncoderBackend::Videotoolbox, VideoCodec::Av1) => Some("av1_videotoolbox"),
+        (EncoderBackend::Vaapi, VideoCodec::H264) => Some("h264_vaapi"),
+        (EncoderBackend::Vaapi, VideoCodec::Hevc) => Some("hevc_vaapi"),
+        (EncoderBackend::Vaapi, VideoCodec::Av1) => Some("av1_vaapi"),
+        (EncoderBackend::Vaapi, VideoCodec::Vp9) => Some("vp9_vaapi"),
+        (EncoderBackend::Mf, VideoCodec::H264) => Some("h264_mf"),
+        (EncoderBackend::Mf, VideoCodec::Hevc) => Some("hevc_mf"),
+        _ => None,
+    }
+}
+
+pub fn probe_ffmpeg_encoder_names() -> anyhow::Result<Vec<String>> {
+    let ffmpeg_path = find_ffmpeg()?;
+
+    let output = std::process::Command::new(&ffmpeg_path)
+        .arg("-hide_banner")
+        .arg("-encoders")
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to execute FFmpeg: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("FFmpeg encoder probe failed: {}", stderr);
+    }
+
+    Ok(parse_ffmpeg_encoder_names(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_ffmpeg_encoder_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(parse_encoder_line)
+        .map(|info| info.ffmpeg_name)
+        .collect()
+}
+
 /// Parse FFmpeg encoder output to extract hardware encoder info.
 ///
 /// Output format: "V....D h264_vaapi   H.264/AVC (VAAPI)"
@@ -250,7 +304,8 @@ mod tests {
 
     #[test]
     fn test_parse_encoder_line_nvenc() {
-        let line = " V....D h264_nvenc           NVIDIA NVENC H.264 encoder [NVIDIA GeForce RTX 3080]";
+        let line =
+            " V....D h264_nvenc           NVIDIA NVENC H.264 encoder [NVIDIA GeForce RTX 3080]";
         let info = parse_encoder_line(line).unwrap();
         assert_eq!(info.ffmpeg_name, "h264_nvenc");
         assert_eq!(info.codec_name, "h264");
@@ -259,7 +314,8 @@ mod tests {
 
     #[test]
     fn test_parse_encoder_line_qsv() {
-        let line = " V..... hevc_qsv             Intel Quick Sync Video HEVC encoder [Intel Iris Xe]";
+        let line =
+            " V..... hevc_qsv             Intel Quick Sync Video HEVC encoder [Intel Iris Xe]";
         let info = parse_encoder_line(line).unwrap();
         assert_eq!(info.ffmpeg_name, "hevc_qsv");
         assert_eq!(info.codec_name, "hevc");
@@ -321,5 +377,35 @@ mod tests {
         };
         let encoder = map_ffmpeg_encoder(&info);
         assert!(encoder.is_none());
+    }
+
+    #[test]
+    fn test_ffmpeg_encoder_name_for_backend() {
+        assert_eq!(
+            ffmpeg_encoder_name_for_backend(EncoderBackend::Qsv, VideoCodec::H264),
+            Some("h264_qsv")
+        );
+        assert_eq!(
+            ffmpeg_encoder_name_for_backend(EncoderBackend::Amf, VideoCodec::Hevc),
+            Some("hevc_amf")
+        );
+        assert_eq!(
+            ffmpeg_encoder_name_for_backend(EncoderBackend::Software, VideoCodec::H264),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_ffmpeg_encoder_names() {
+        let output = "\
+ V....D h264_amf             AMD AMF H.264 Encoder
+ V..... h264_qsv             Intel Quick Sync Video
+ V....D libx264              libx264 H.264 encoder
+";
+
+        assert_eq!(
+            parse_ffmpeg_encoder_names(output),
+            vec!["h264_amf".to_string(), "h264_qsv".to_string()]
+        );
     }
 }

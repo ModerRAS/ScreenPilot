@@ -7,7 +7,9 @@ mod media_server;
 mod persistence;
 mod state;
 
-use crate::encoder::{detect_hw_encoders, DetectionResult};
+use crate::encoder::{
+    detect_hw_encoders, detect_preferred_h264_encoder, DetectionResult, EncoderBackend,
+};
 
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
@@ -683,48 +685,30 @@ enum HardwareEncoder {
 }
 
 fn detect_hardware_encoder() -> HardwareEncoder {
-    let output = std::process::Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-encoders")
-        .output();
-
-    match output {
-        Ok(o) => {
-            let encoders = String::from_utf8_lossy(&o.stdout);
-
-            if encoders.contains("h264_amf") {
-                log::info!("Using AMD GPU hardware encoding (VCE)");
-                return HardwareEncoder::AmdVce;
-            }
-
-            if encoders.contains("h264_nvenc") {
-                log::info!("Using NVIDIA GPU hardware encoding");
-                return HardwareEncoder::Nvidia;
-            }
-
-            if encoders.contains("h264_qsv") {
-                log::info!("Using Intel Quick Sync Video hardware encoding");
-                return HardwareEncoder::IntelQsv;
-            }
-
-            if encoders.contains("h264_videotoolbox") {
-                log::info!("Using Apple VideoToolbox hardware encoding");
-                return HardwareEncoder::AppleVtb;
-            }
-
-            #[cfg(target_os = "linux")]
-            if encoders.contains("h264_vaapi") {
-                log::info!("Using VAAPI hardware encoding");
-                return HardwareEncoder::Vaapi;
-            }
-        }
-        Err(e) => {
-            log::warn!("Failed to detect hardware encoders: {}", e);
+    if let Some(encoder) = detect_preferred_h264_encoder() {
+        if let Some(hardware_encoder) = hardware_encoder_from_backend(encoder.backend) {
+            log::info!(
+                "Using detected hardware encoder {} ({})",
+                encoder.ffmpeg_name,
+                encoder.backend
+            );
+            return hardware_encoder;
         }
     }
 
     log::info!("No hardware encoder found, using software encoding");
     HardwareEncoder::None
+}
+
+fn hardware_encoder_from_backend(backend: EncoderBackend) -> Option<HardwareEncoder> {
+    match backend {
+        EncoderBackend::Nvenc => Some(HardwareEncoder::Nvidia),
+        EncoderBackend::Qsv => Some(HardwareEncoder::IntelQsv),
+        EncoderBackend::Amf => Some(HardwareEncoder::AmdVce),
+        EncoderBackend::Videotoolbox => Some(HardwareEncoder::AppleVtb),
+        EncoderBackend::Vaapi => Some(HardwareEncoder::Vaapi),
+        EncoderBackend::Mf | EncoderBackend::Software => None,
+    }
 }
 
 fn get_encoder_from_preference(pref: &str) -> HardwareEncoder {
@@ -1377,7 +1361,11 @@ async fn prepare_media_uri(
 
 fn enqueue_media_cache_prewarm(app: &WebAppState, filename: &str) {
     if let Err(e) = app.media_cache_prewarm_tx.send(filename.to_string()) {
-        log::warn!("Failed to enqueue media cache prewarm for {}: {}", filename, e);
+        log::warn!(
+            "Failed to enqueue media cache prewarm for {}: {}",
+            filename,
+            e
+        );
     }
 }
 
@@ -2525,6 +2513,20 @@ mod tests {
             get_encoder_from_preference("vaapi"),
             HardwareEncoder::Vaapi
         ));
+    }
+
+    #[test]
+    fn test_hardware_encoder_from_backend() {
+        assert!(matches!(
+            hardware_encoder_from_backend(EncoderBackend::Qsv),
+            Some(HardwareEncoder::IntelQsv)
+        ));
+        assert!(matches!(
+            hardware_encoder_from_backend(EncoderBackend::Amf),
+            Some(HardwareEncoder::AmdVce)
+        ));
+        assert!(hardware_encoder_from_backend(EncoderBackend::Mf).is_none());
+        assert!(hardware_encoder_from_backend(EncoderBackend::Software).is_none());
     }
 
     #[test]
