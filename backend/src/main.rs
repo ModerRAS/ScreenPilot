@@ -38,6 +38,8 @@ use state::{PlaybackStatus, RendererDevice, Scene, SharedState};
 
 static CACHE_JOB_LOCKS: Lazy<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     Lazy::new(|| StdMutex::new(HashMap::new()));
+static AUTO_HARDWARE_ENCODER_CACHE: Lazy<StdMutex<Option<HardwareEncoder>>> =
+    Lazy::new(|| StdMutex::new(None));
 
 const AUTH_COOKIE_NAME: &str = "screenpilot_session";
 const AUTH_COOKIE_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -674,7 +676,7 @@ async fn list_media_files(State(app): State<WebAppState>) -> Json<Vec<MediaFileI
     Json(list_media_file_infos(&app.media_dir))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HardwareEncoder {
     None,
     Nvidia,
@@ -684,7 +686,7 @@ enum HardwareEncoder {
     Vaapi,
 }
 
-fn detect_hardware_encoder() -> HardwareEncoder {
+fn detect_hardware_encoder_uncached() -> HardwareEncoder {
     if let Some(encoder) = detect_preferred_h264_encoder() {
         if let Some(hardware_encoder) = hardware_encoder_from_backend(encoder.backend) {
             log::info!(
@@ -698,6 +700,28 @@ fn detect_hardware_encoder() -> HardwareEncoder {
 
     log::info!("No hardware encoder found, using software encoding");
     HardwareEncoder::None
+}
+
+fn detect_hardware_encoder() -> HardwareEncoder {
+    let mut cached = AUTO_HARDWARE_ENCODER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(encoder) = *cached {
+        log::debug!("Using cached hardware encoder: {:?}", encoder);
+        return encoder;
+    }
+
+    let detected = detect_hardware_encoder_uncached();
+    *cached = Some(detected);
+    detected
+}
+
+fn clear_auto_hardware_encoder_cache() {
+    let mut cached = AUTO_HARDWARE_ENCODER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cached = None;
 }
 
 fn hardware_encoder_from_backend(backend: EncoderBackend) -> Option<HardwareEncoder> {
@@ -1900,6 +1924,7 @@ async fn set_encoder(
     }
     let mut st = app.shared.write().await;
     st.preferred_encoder = body.encoder;
+    clear_auto_hardware_encoder_cache();
     Ok(StatusCode::OK)
 }
 
