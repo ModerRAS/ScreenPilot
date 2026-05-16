@@ -27,6 +27,7 @@ const isDragging = ref(false)
 const uploadQueue = ref<UploadItem[]>([])
 
 let isProcessingQueue = false
+let uploadIdSequence = 0
 
 const totalMediaSize = computed(() =>
   store.mediaFileDetails.reduce((total, file) => total + file.size, 0),
@@ -74,7 +75,7 @@ async function handleDrop(event: DragEvent) {
 async function enqueueFiles(files: File[]) {
   for (const file of files) {
     uploadQueue.value.push({
-      id: `${file.name}-${file.size}-${file.lastModified}-${crypto.randomUUID()}`,
+      id: createUploadId(file),
       file,
       name: file.name,
       size: file.size,
@@ -87,6 +88,27 @@ async function enqueueFiles(files: File[]) {
   }
 
   await processUploadQueue()
+}
+
+function createUploadId(file: File): string {
+  uploadIdSequence += 1
+  return `${file.name}-${file.size}-${file.lastModified}-${Date.now()}-${uploadIdSequence}-${randomIdPart()}`
+}
+
+function randomIdPart(): string {
+  const cryptoObject = globalThis.crypto
+
+  if (typeof cryptoObject?.randomUUID === 'function') {
+    return cryptoObject.randomUUID()
+  }
+
+  if (typeof cryptoObject?.getRandomValues === 'function') {
+    const values = new Uint32Array(2)
+    cryptoObject.getRandomValues(values)
+    return Array.from(values, value => value.toString(36)).join('')
+  }
+
+  return Math.random().toString(36).slice(2)
 }
 
 async function processUploadQueue() {
