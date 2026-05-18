@@ -11,6 +11,11 @@ permissions:
 jobs:
   build-linux:
     runs-on: ubuntu-22.04
+    env:
+      SCREENPILOT_BUILD_CHANNEL: nightly
+      SCREENPILOT_BUILD_NUMBER: ${{ github.run_number }}
+      SCREENPILOT_GIT_SHA: ${{ github.sha }}
+      SCREENPILOT_TARGET: x86_64-unknown-linux-gnu
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -86,6 +91,11 @@ jobs:
 
   build-macos-arm:
     runs-on: macos-latest
+    env:
+      SCREENPILOT_BUILD_CHANNEL: nightly
+      SCREENPILOT_BUILD_NUMBER: ${{ github.run_number }}
+      SCREENPILOT_GIT_SHA: ${{ github.sha }}
+      SCREENPILOT_TARGET: aarch64-apple-darwin
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -161,6 +171,11 @@ jobs:
 
   build-macos-intel:
     runs-on: macos-latest
+    env:
+      SCREENPILOT_BUILD_CHANNEL: nightly
+      SCREENPILOT_BUILD_NUMBER: ${{ github.run_number }}
+      SCREENPILOT_GIT_SHA: ${{ github.sha }}
+      SCREENPILOT_TARGET: x86_64-apple-darwin
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -236,6 +251,11 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
+    env:
+      SCREENPILOT_BUILD_CHANNEL: nightly
+      SCREENPILOT_BUILD_NUMBER: ${{ github.run_number }}
+      SCREENPILOT_GIT_SHA: ${{ github.sha }}
+      SCREENPILOT_TARGET: x86_64-pc-windows-msvc
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

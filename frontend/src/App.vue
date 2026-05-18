@@ -6,12 +6,14 @@ import {
   Fold,
   Expand,
   FolderOpened,
+  InfoFilled,
   Lock,
   Monitor,
   SwitchButton,
   User,
 } from '@element-plus/icons-vue'
 import { useAppStore } from '@/stores/app'
+import { displayVersion } from '@/version'
 
 const store = useAppStore()
 const isCollapsed = ref(false)
@@ -159,9 +161,9 @@ const sidebarWidth = computed(() => isCollapsed.value ? '64px' : '200px')
     </div>
   </div>
 
-  <el-container v-else style="min-height: 100vh">
-    <el-header style="display: flex; align-items: center; justify-content: space-between; padding: 0 16px">
-      <div style="display: flex; align-items: center; gap: 12px">
+  <el-container v-else class="app-shell">
+    <el-header class="app-header">
+      <div class="brand-row">
         <el-button 
           :icon="isCollapsed ? Expand : Fold" 
           circle 
@@ -169,8 +171,8 @@ const sidebarWidth = computed(() => isCollapsed.value ? '64px' : '200px')
           class="touch-target"
           @click="toggleSidebar"
         />
-        <div style="display: flex; flex-direction: column; gap: 2px">
-          <h1 style="font-size: 1.2rem; margin: 0">🖥 ScreenPilot</h1>
+        <div class="brand-copy">
+          <h1>ScreenPilot</h1>
           <el-tag v-if="store.mediaServerUrl" type="info" size="small" effect="plain" class="hide-mobile">
             {{ store.mediaServerUrl }}
           </el-tag>
@@ -200,7 +202,7 @@ const sidebarWidth = computed(() => isCollapsed.value ? '64px' : '200px')
       </div>
     </el-header>
 
-    <el-container>
+    <el-container class="app-body">
       <el-aside 
         v-if="!isMobile"
         :width="sidebarWidth"
@@ -222,6 +224,10 @@ const sidebarWidth = computed(() => isCollapsed.value ? '64px' : '200px')
           <el-menu-item index="/scenes">
             <el-icon><Film /></el-icon>
             <span>Scenes</span>
+          </el-menu-item>
+          <el-menu-item index="/about">
+            <el-icon><InfoFilled /></el-icon>
+            <span>About</span>
           </el-menu-item>
         </el-menu>
       </el-aside>
@@ -249,6 +255,10 @@ const sidebarWidth = computed(() => isCollapsed.value ? '64px' : '200px')
             <el-icon><Film /></el-icon>
             <span>Scenes</span>
           </el-menu-item>
+          <el-menu-item index="/about">
+            <el-icon><InfoFilled /></el-icon>
+            <span>About</span>
+          </el-menu-item>
         </el-menu>
       </el-drawer>
 
@@ -256,6 +266,12 @@ const sidebarWidth = computed(() => isCollapsed.value ? '64px' : '200px')
         <RouterView />
       </el-main>
     </el-container>
+
+    <el-footer class="app-footer" height="32px">
+      <RouterLink class="version-footer" to="/about">
+        {{ displayVersion }}
+      </RouterLink>
+    </el-footer>
   </el-container>
 </template>
 
@@ -297,6 +313,42 @@ const sidebarWidth = computed(() => isCollapsed.value ? '64px' : '200px')
   width: 100%;
 }
 
+.app-shell {
+  min-height: 100vh;
+}
+
+.app-body {
+  flex: 1;
+  min-height: 0;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+}
+
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.brand-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.brand-copy h1 {
+  margin: 0;
+  font-size: 1.2rem;
+  line-height: 1.2;
+}
+
 .header-actions {
   display: flex;
   align-items: center;
@@ -306,6 +358,36 @@ const sidebarWidth = computed(() => isCollapsed.value ? '64px' : '200px')
 .touch-target {
   min-height: 44px;
   min-width: 44px;
+}
+
+.el-aside {
+  display: flex;
+  flex-direction: column;
+}
+
+.el-menu {
+  border-right: 0;
+}
+
+.app-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0 16px;
+  border-top: 1px solid var(--el-border-color-lighter);
+  background: var(--el-bg-color);
+}
+
+.version-footer {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.3;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.version-footer:hover {
+  color: var(--el-color-primary);
 }
 
 @media (max-width: 767px) {
