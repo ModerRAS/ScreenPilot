@@ -228,6 +228,7 @@ type ApiError = (StatusCode, Json<ErrorResponse>);
 
 const MAX_DEVICE_ALIAS_CHARS: usize = 64;
 const MAX_SCENE_NAME_CHARS: usize = 80;
+const SCENE_APPLY_LOOP_PLAYBACK: bool = true;
 
 fn error_response(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(ErrorResponse { error: msg.into() }))
@@ -2000,10 +2001,10 @@ async fn apply_scene(
 
     let mut results = Vec::new();
     for (uuid, filename) in &assignments {
-        let (av_url, loop_playback) = {
+        let av_url = {
             let st = app.shared.read().await;
             match st.devices.iter().find(|d| d.uuid == *uuid) {
-                Some(device) => (device.av_transport_url.clone(), device.loop_playback),
+                Some(device) => device.av_transport_url.clone(),
                 None => {
                     results.push(SceneApplyResult {
                         device_uuid: uuid.clone(),
@@ -2039,7 +2040,7 @@ async fn apply_scene(
             &client,
             &av_url,
             &media_uri,
-            loop_playback,
+            SCENE_APPLY_LOOP_PLAYBACK,
             Some(&loop_media_uri),
         )
         .await
@@ -2446,6 +2447,11 @@ mod tests {
             normalized.get("device-a"),
             Some(&"promo.mp4".to_string())
         );
+    }
+
+    #[test]
+    fn test_scene_apply_uses_loop_playback_by_default() {
+        assert!(SCENE_APPLY_LOOP_PLAYBACK);
     }
 
     #[test]
