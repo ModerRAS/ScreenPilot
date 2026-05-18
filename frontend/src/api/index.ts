@@ -102,8 +102,12 @@ export async function getScenes(): Promise<Scene[]> {
   return data
 }
 
-export async function saveScene(name: string, assignments: Record<string, string>): Promise<void> {
-  await api.post('/scenes', { name, assignments })
+export async function saveScene(
+  name: string,
+  assignments: Record<string, string>,
+  previousName?: string,
+): Promise<void> {
+  await api.post('/scenes', { name, assignments, previous_name: previousName })
 }
 
 export async function deleteScene(name: string): Promise<void> {

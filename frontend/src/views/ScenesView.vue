@@ -12,6 +12,12 @@ const editingName = ref('')
 const sceneName = ref('')
 const sceneAssignments = ref<Record<string, string>>({})
 
+function normalizedAssignments() {
+  return Object.fromEntries(
+    Object.entries(sceneAssignments.value).filter(([, file]) => Boolean(file)),
+  )
+}
+
 function showEditor(scene?: Scene) {
   if (scene) {
     editingName.value = scene.name
@@ -44,7 +50,7 @@ async function save() {
     return
   }
   try {
-    await api.saveScene(sceneName.value.trim(), sceneAssignments.value)
+    await api.saveScene(sceneName.value.trim(), normalizedAssignments(), editingName.value || undefined)
     await store.loadScenes()
     hideEditor()
     ElMessage.success(`Scene "${sceneName.value}" saved.`)
@@ -137,6 +143,7 @@ async function apply(name: string) {
               placeholder="— none —"
               clearable
               size="large"
+              :disabled="store.mediaFiles.length === 0"
               style="width: 100%"
             >
               <el-option

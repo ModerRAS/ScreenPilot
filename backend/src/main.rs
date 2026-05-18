@@ -213,7 +213,10 @@ struct RenameMediaRequest {
 #[derive(Deserialize)]
 struct SaveSceneRequest {
     name: String,
-    assignments: HashMap<String, String>,
+    #[serde(default)]
+    previous_name: Option<String>,
+    #[serde(default)]
+    assignments: HashMap<String, Option<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -224,6 +227,7 @@ struct ErrorResponse {
 type ApiError = (StatusCode, Json<ErrorResponse>);
 
 const MAX_DEVICE_ALIAS_CHARS: usize = 64;
+const MAX_SCENE_NAME_CHARS: usize = 80;
 
 fn error_response(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(ErrorResponse { error: msg.into() }))
@@ -366,6 +370,60 @@ fn normalize_device_alias(alias: Option<String>) -> Result<Option<String>, ApiEr
     }
 
     Ok(Some(alias.to_string()))
+}
+
+fn normalize_scene_name(name: &str) -> Result<String, ApiError> {
+    if name.contains('\0') || name.contains('/') || name.contains('\\') {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid scene name",
+        ));
+    }
+
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Scene name is required",
+        ));
+    }
+
+    if name.chars().count() > MAX_SCENE_NAME_CHARS {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Scene name must be {} characters or fewer", MAX_SCENE_NAME_CHARS),
+        ));
+    }
+
+    Ok(name.to_string())
+}
+
+fn normalize_scene_assignments(
+    assignments: HashMap<String, Option<String>>,
+) -> Result<HashMap<String, String>, ApiError> {
+    let mut normalized = HashMap::new();
+
+    for (uuid, filename) in assignments {
+        if uuid.trim().is_empty() || uuid.contains('\0') {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid scene device assignment",
+            ));
+        }
+
+        let Some(filename) = filename else {
+            continue;
+        };
+
+        if filename.is_empty() {
+            continue;
+        }
+
+        validate_media_filename(&filename)?;
+        normalized.insert(uuid, filename);
+    }
+
+    Ok(normalized)
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -1771,6 +1829,15 @@ async fn delete_media_file(
     for scene in &mut st.scenes {
         scene.assignments.retain(|_, media| media != &filename);
     }
+    let scenes_to_save = st.scenes.clone();
+    drop(st);
+
+    persistence::save_scenes(&scenes_to_save).map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save scenes after media delete: {}", e),
+        )
+    })?;
 
     Ok(StatusCode::OK)
 }
@@ -1824,7 +1891,15 @@ async fn rename_media_file(
             }
         }
     }
+    let scenes_to_save = st.scenes.clone();
     drop(st);
+
+    persistence::save_scenes(&scenes_to_save).map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save scenes after media rename: {}", e),
+        )
+    })?;
 
     let file = media_file_info(&app.media_dir, &body.new_name)?;
     enqueue_media_cache_prewarm(&app, &body.new_name);
@@ -1842,19 +1917,40 @@ async fn save_scene(
     State(app): State<WebAppState>,
     Json(body): Json<SaveSceneRequest>,
 ) -> Result<StatusCode, ApiError> {
-    for filename in body.assignments.values() {
-        validate_media_filename(filename)?;
-    }
+    let name = normalize_scene_name(&body.name)?;
+    let previous_name = body
+        .previous_name
+        .as_deref()
+        .map(normalize_scene_name)
+        .transpose()?;
+    let assignments = normalize_scene_assignments(body.assignments)?;
+
     let scene = Scene {
-        name: body.name,
-        assignments: body.assignments,
+        name: name.clone(),
+        assignments,
     };
     let mut st = app.shared.write().await;
+    if let Some(previous_name) = previous_name.as_deref() {
+        if previous_name != name {
+            st.scenes.retain(|s| s.name != previous_name);
+        }
+    }
     if let Some(existing) = st.scenes.iter_mut().find(|s| s.name == scene.name) {
         *existing = scene;
     } else {
         st.scenes.push(scene);
     }
+    st.scenes.sort_by(|a, b| a.name.cmp(&b.name));
+    let scenes_to_save = st.scenes.clone();
+    drop(st);
+
+    persistence::save_scenes(&scenes_to_save).map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save scenes: {}", e),
+        )
+    })?;
+
     Ok(StatusCode::OK)
 }
 
@@ -1862,10 +1958,24 @@ async fn save_scene(
 async fn delete_scene(
     State(app): State<WebAppState>,
     Path(scene_name): Path<String>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
     let mut st = app.shared.write().await;
+    let before = st.scenes.len();
     st.scenes.retain(|s| s.name != scene_name);
-    StatusCode::OK
+    if st.scenes.len() == before {
+        return Err(error_response(StatusCode::NOT_FOUND, "Scene not found"));
+    }
+    let scenes_to_save = st.scenes.clone();
+    drop(st);
+
+    persistence::save_scenes(&scenes_to_save).map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save scenes: {}", e),
+        )
+    })?;
+
+    Ok(StatusCode::OK)
 }
 
 /// POST /api/scenes/:name/apply — apply a scene to all assigned devices.
@@ -2109,6 +2219,8 @@ async fn main() {
         let mut s = shared.write().await;
         s.devices = persistence::load_devices();
         log::info!("Loaded {} devices from persistence", s.devices.len());
+        s.scenes = persistence::load_scenes();
+        log::info!("Loaded {} scenes from persistence", s.scenes.len());
         s.media_server_base_url = media_base_url;
         s.preferred_encoder = "auto".to_string();
         s.loop_playback = true;
@@ -2307,6 +2419,33 @@ mod tests {
         let alias = "a".repeat(MAX_DEVICE_ALIAS_CHARS + 1);
         let result = normalize_device_alias(Some(alias));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_normalize_scene_name_trims_and_rejects_route_separators() {
+        assert_eq!(
+            normalize_scene_name("  Lobby Scene  ").unwrap(),
+            "Lobby Scene"
+        );
+        assert!(normalize_scene_name("").is_err());
+        assert!(normalize_scene_name("Lobby/Scene").is_err());
+        assert!(normalize_scene_name("Lobby\\Scene").is_err());
+    }
+
+    #[test]
+    fn test_normalize_scene_assignments_filters_empty_values() {
+        let mut assignments = HashMap::new();
+        assignments.insert("device-a".to_string(), Some("promo.mp4".to_string()));
+        assignments.insert("device-b".to_string(), Some("".to_string()));
+        assignments.insert("device-c".to_string(), None);
+
+        let normalized = normalize_scene_assignments(assignments).unwrap();
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(
+            normalized.get("device-a"),
+            Some(&"promo.mp4".to_string())
+        );
     }
 
     #[test]
