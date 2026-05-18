@@ -135,5 +135,5 @@ export async function getDeviceLoop(uuid: string): Promise<boolean> {
 }
 
 export async function setDeviceLoop(uuid: string, loop: boolean): Promise<void> {
-  await api.put(`/devices/${encodeURIComponent(uuid)}/loop`, { loop })
+  await api.put(`/devices/${encodeURIComponent(uuid)}/loop`, { loop_playback: loop })
 }

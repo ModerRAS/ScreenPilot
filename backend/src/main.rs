@@ -2018,6 +2018,7 @@ struct SetEncoderRequest {
 
 #[derive(Deserialize)]
 struct SetLoopRequest {
+    #[serde(alias = "loop")]
     loop_playback: bool,
 }
 
@@ -2570,6 +2571,16 @@ mod tests {
             media_loop_stream_url("http://127.0.0.1:8080/", "promo loop 01.mp4"),
             "http://127.0.0.1:8080/api/media/stream-loop/promo%20loop%2001.mp4"
         );
+    }
+
+    #[test]
+    fn test_set_loop_request_accepts_current_and_legacy_fields() {
+        let current: SetLoopRequest =
+            serde_json::from_str(r#"{"loop_playback":true}"#).unwrap();
+        let legacy: SetLoopRequest = serde_json::from_str(r#"{"loop":false}"#).unwrap();
+
+        assert!(current.loop_playback);
+        assert!(!legacy.loop_playback);
     }
 
     #[test]
