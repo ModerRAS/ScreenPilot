@@ -3,6 +3,18 @@ use log::{debug, warn};
 use reqwest::Client;
 use std::time::Duration;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportInfo {
+    pub current_transport_state: String,
+    pub current_transport_status: String,
+    pub current_speed: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaInfo {
+    pub current_uri: String,
+}
+
 /// Build the SOAP envelope for a UPnP AVTransport action.
 fn soap_envelope(action: &str, args: &str) -> String {
     format!(
@@ -22,16 +34,8 @@ fn soap_envelope(action: &str, args: &str) -> String {
 }
 
 /// Send a SOAP action to the given AVTransport control URL.
-async fn send_soap(
-    client: &Client,
-    url: &str,
-    action: &str,
-    body: &str,
-) -> Result<String> {
-    let soap_action = format!(
-        "\"urn:schemas-upnp-org:service:AVTransport:1#{}\"",
-        action
-    );
+async fn send_soap(client: &Client, url: &str, action: &str, body: &str) -> Result<String> {
+    let soap_action = format!("\"urn:schemas-upnp-org:service:AVTransport:1#{}\"", action);
 
     debug!("SOAP → {} : {} ", url, action);
     debug!("SOAP body:\n{}", body);
@@ -94,12 +98,33 @@ pub async fn stop(client: &Client, av_transport_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// GetTransportInfo — read the renderer's actual AVTransport state.
+pub async fn get_transport_info(client: &Client, av_transport_url: &str) -> Result<TransportInfo> {
+    let body = soap_envelope("GetTransportInfo", "");
+    let response = send_soap(client, av_transport_url, "GetTransportInfo", &body).await?;
+
+    Ok(TransportInfo {
+        current_transport_state: extract_xml_text(&response, "CurrentTransportState")
+            .unwrap_or_else(|| "UNKNOWN".to_string()),
+        current_transport_status: extract_xml_text(&response, "CurrentTransportStatus")
+            .unwrap_or_else(|| "UNKNOWN".to_string()),
+        current_speed: extract_xml_text(&response, "CurrentSpeed")
+            .unwrap_or_else(|| "1".to_string()),
+    })
+}
+
+/// GetMediaInfo — read the renderer's current media URI.
+pub async fn get_media_info(client: &Client, av_transport_url: &str) -> Result<MediaInfo> {
+    let body = soap_envelope("GetMediaInfo", "");
+    let response = send_soap(client, av_transport_url, "GetMediaInfo", &body).await?;
+
+    Ok(MediaInfo {
+        current_uri: extract_xml_text(&response, "CurrentURI").unwrap_or_default(),
+    })
+}
+
 /// SetPlayMode — request a renderer-side play mode when supported.
-pub async fn set_play_mode(
-    client: &Client,
-    av_transport_url: &str,
-    play_mode: &str,
-) -> Result<()> {
+pub async fn set_play_mode(client: &Client, av_transport_url: &str, play_mode: &str) -> Result<()> {
     let args = format!("<NewPlayMode>{}</NewPlayMode>", xml_escape(play_mode));
     let body = soap_envelope("SetPlayMode", &args);
     send_soap(client, av_transport_url, "SetPlayMode", &body).await?;
@@ -145,15 +170,20 @@ pub async fn play_media(
 ) -> Result<()> {
     // Stop first (best-effort – ignore errors)
     let _ = stop(client, av_transport_url).await;
-    set_av_transport_uri(client, av_transport_url, media_uri).await?;
+
+    let playback_uri = if loop_playback {
+        loop_media_uri.unwrap_or(media_uri)
+    } else {
+        media_uri
+    };
+    set_av_transport_uri(client, av_transport_url, playback_uri).await?;
 
     if loop_playback {
         let native_loop = set_play_mode_best_effort(client, av_transport_url, "REPEAT_ONE").await;
-        if !native_loop {
-            if let Some(loop_media_uri) = loop_media_uri {
-                warn!("Renderer does not support native loop playback, falling back to loop stream");
-                set_av_transport_uri(client, av_transport_url, loop_media_uri).await?;
-            }
+        if !native_loop && loop_media_uri.is_some() {
+            warn!(
+                "Renderer did not accept native loop playback; ScreenPilot is using ffmpeg loop stream"
+            );
         }
     } else {
         let _ = set_play_mode_best_effort(client, av_transport_url, "NORMAL").await;
@@ -172,14 +202,28 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
+    let start = format!("<{}>", tag);
+    let end = format!("</{}>", tag);
+    let start_index = xml.find(&start)? + start.len();
+    let end_index = xml[start_index..].find(&end)? + start_index;
+    Some(xml[start_index..end_index].trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_xml_escape() {
-        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
-        assert_eq!(xml_escape("http://host/media/ad.mp4"), "http://host/media/ad.mp4");
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+        assert_eq!(
+            xml_escape("http://host/media/ad.mp4"),
+            "http://host/media/ad.mp4"
+        );
     }
 
     #[test]
@@ -209,6 +253,29 @@ mod tests {
         let body = soap_envelope("SetPlayMode", "<NewPlayMode>REPEAT_ONE</NewPlayMode>");
         assert!(body.contains("<u:SetPlayMode xmlns:u="));
         assert!(body.contains("<NewPlayMode>REPEAT_ONE</NewPlayMode>"));
+    }
+
+    #[test]
+    fn test_soap_envelope_get_transport_info() {
+        let body = soap_envelope("GetTransportInfo", "");
+        assert!(body.contains("<u:GetTransportInfo xmlns:u="));
+        assert!(body.contains("<InstanceID>0</InstanceID>"));
+    }
+
+    #[test]
+    fn test_soap_envelope_get_media_info() {
+        let body = soap_envelope("GetMediaInfo", "");
+        assert!(body.contains("<u:GetMediaInfo xmlns:u="));
+        assert!(body.contains("<InstanceID>0</InstanceID>"));
+    }
+
+    #[test]
+    fn test_extract_xml_text() {
+        let xml = "<CurrentTransportState>PLAYING</CurrentTransportState>";
+        assert_eq!(
+            extract_xml_text(xml, "CurrentTransportState"),
+            Some("PLAYING".to_string())
+        );
     }
 
     #[test]
@@ -251,11 +318,11 @@ mod tests {
     #[test]
     fn test_soap_action_header_format() {
         let action = "Play";
-        let soap_action = format!(
-            "\"urn:schemas-upnp-org:service:AVTransport:1#{}\"",
-            action
+        let soap_action = format!("\"urn:schemas-upnp-org:service:AVTransport:1#{}\"", action);
+        assert_eq!(
+            soap_action,
+            "\"urn:schemas-upnp-org:service:AVTransport:1#Play\""
         );
-        assert_eq!(soap_action, "\"urn:schemas-upnp-org:service:AVTransport:1#Play\"");
     }
 
     #[test]

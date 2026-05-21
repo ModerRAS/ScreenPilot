@@ -3,8 +3,8 @@
 //! This module validates that encoders actually work at runtime by running
 //! a minimal ffmpeg test with the encoder.
 
-use std::process::Stdio;
 use crate::encoder::HwEncoder;
+use std::process::Stdio;
 use std::time::Instant;
 use tokio::time::{timeout, Duration};
 
@@ -47,8 +47,9 @@ pub async fn validate_encoder_runtime(encoder: &HwEncoder) -> bool {
 
     let validation_result = timeout(
         Duration::from_secs(VALIDATION_TIMEOUT_SECS),
-        run_ffmpeg_validation(encoder_name)
-    ).await;
+        run_ffmpeg_validation(encoder_name),
+    )
+    .await;
 
     let elapsed = start.elapsed();
     log::debug!(
@@ -99,7 +100,11 @@ pub async fn validate_encoder_runtime(encoder: &HwEncoder) -> bool {
             true
         }
         Ok(Err(e)) => {
-            log::warn!("[encoder] L4: {} validation failed to run: {}", encoder_name, e);
+            log::warn!(
+                "[encoder] L4: {} validation failed to run: {}",
+                encoder_name,
+                e
+            );
             false
         }
         Err(_) => {

@@ -10,6 +10,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::media_server;
 use crate::state::RendererDevice;
 
+pub const DEFAULT_RENDERER_LOOP_PLAYBACK: bool = true;
+
 const SSDP_ADDR: &str = "239.255.255.250";
 const SSDP_PORT: u16 = 1900;
 const SEARCH_TARGETS: &[&str] = &[
@@ -41,28 +43,34 @@ fn ssdp_search(_timeout: Duration) -> Result<Vec<String>> {
 
 fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> {
     info!("Starting SSDP search for target: {}", target);
-    
+
     let raw_socket =
         Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).context("create UDP socket")?;
-    raw_socket.set_reuse_address(true).context("set_reuse_address")?;
-    
-    raw_socket.set_multicast_ttl_v4(4).context("set_multicast_ttl_v4")?;
+    raw_socket
+        .set_reuse_address(true)
+        .context("set_reuse_address")?;
+
+    raw_socket
+        .set_multicast_ttl_v4(4)
+        .context("set_multicast_ttl_v4")?;
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-    raw_socket.bind(&bind_addr.into()).context("bind UDP socket")?;
+    raw_socket
+        .bind(&bind_addr.into())
+        .context("bind UDP socket")?;
 
     raw_socket
         .set_multicast_loop_v4(true)
         .context("set_multicast_loop_v4")?;
 
     let local_ip_result = media_server::local_ip();
-    
+
     // local_ip() uses UDP connect trick to 8.8.8.8:80 - fails without internet
     if local_ip_result.is_none() {
         warn!("local_ip() returned None - likely no internet connectivity or network issue.");
         warn!("DLNA discovery requires internet connectivity to determine the LAN interface IP.");
     }
-    
+
     let multicast_iface = local_ip_result
         .as_ref()
         .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
@@ -70,7 +78,10 @@ fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> 
 
     // Warn if we got loopback or undefined - DLNA won't work over localhost
     if multicast_iface.is_loopback() || multicast_iface == Ipv4Addr::new(0, 0, 0, 0) {
-        warn!("local_ip() returned {} - this is not a LAN interface! DLNA discovery may fail.", multicast_iface);
+        warn!(
+            "local_ip() returned {} - this is not a LAN interface! DLNA discovery may fail.",
+            multicast_iface
+        );
         warn!("Check network configuration: ensure machine has a valid LAN IP (not 127.0.0.1) and internet connectivity.");
     }
 
@@ -81,8 +92,12 @@ fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> 
             &"239.255.255.250".parse::<Ipv4Addr>().unwrap(),
             &multicast_iface,
         )
-        .context("join_multicast_v4") {
-        error!("Failed to join SSDP multicast group: {}. DLNA discovery will not work.", e);
+        .context("join_multicast_v4")
+    {
+        error!(
+            "Failed to join SSDP multicast group: {}. DLNA discovery will not work.",
+            e
+        );
         return Err(e);
     }
 
@@ -106,14 +121,17 @@ fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> 
         IpAddr::V4(SSDP_ADDR.parse::<Ipv4Addr>().unwrap()),
         SSDP_PORT,
     );
-    
+
     debug!("Sending M-SEARCH request:\n{}", request);
-    
+
     socket
         .send_to(request.as_bytes(), dest)
         .context("send M-SEARCH")?;
 
-    info!("M-SEARCH sent to {}:{}, waiting for responses...", SSDP_ADDR, SSDP_PORT);
+    info!(
+        "M-SEARCH sent to {}:{}, waiting for responses...",
+        SSDP_ADDR, SSDP_PORT
+    );
     eprintln!("[DEBUG] M-SEARCH sent for target: {}", target);
 
     let mut locations: Vec<String> = Vec::new();
@@ -127,7 +145,10 @@ fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> 
                 eprintln!("[DEBUG] Received {} bytes from {}", len, src);
                 info!("Received SSDP response #{} from {}", response_count, src);
                 let response = String::from_utf8_lossy(&buf[..len]);
-                eprintln!("[DEBUG] Raw response: {:?}", &response[..response.len().min(200)]);
+                eprintln!(
+                    "[DEBUG] Raw response: {:?}",
+                    &response[..response.len().min(200)]
+                );
                 debug!("SSDP response:\n{}", response);
                 if let Some(location) = parse_location(&response) {
                     eprintln!("[DEBUG] Found location: {}", location);
@@ -147,7 +168,11 @@ fn search_single_target(target: &str, timeout: Duration) -> Result<Vec<String>> 
         }
     }
 
-    info!("SSDP discovery complete. Received {} responses, found {} locations", response_count, locations.len());
+    info!(
+        "SSDP discovery complete. Received {} responses, found {} locations",
+        response_count,
+        locations.len()
+    );
 
     Ok(locations)
 }
@@ -170,10 +195,7 @@ fn parse_location(response: &str) -> Option<String> {
 }
 
 /// Fetch the device description XML at `location` and extract the device info.
-async fn fetch_device_description(
-    client: &Client,
-    location: &str,
-) -> Result<RendererDevice> {
+async fn fetch_device_description(client: &Client, location: &str) -> Result<RendererDevice> {
     let max_retries = 3;
 
     for attempt in 0..max_retries {
@@ -192,10 +214,7 @@ async fn fetch_device_description(
     unreachable!()
 }
 
-async fn fetch_device_description_once(
-    client: &Client,
-    location: &str,
-) -> Result<RendererDevice> {
+async fn fetch_device_description_once(client: &Client, location: &str) -> Result<RendererDevice> {
     let body = client
         .get(location)
         .timeout(Duration::from_secs(10))
@@ -210,8 +229,7 @@ async fn fetch_device_description_once(
         .map(|u| u.trim_start_matches("uuid:").to_string())
         .unwrap_or_else(|| location.to_string());
 
-    let name = extract_xml_text(&body, "friendlyName")
-        .unwrap_or_else(|| "Unknown".to_string());
+    let name = extract_xml_text(&body, "friendlyName").unwrap_or_else(|| "Unknown".to_string());
 
     // Parse IP from the location URL
     let ip = url_host(location).unwrap_or_else(|| "unknown".to_string());
@@ -228,7 +246,7 @@ async fn fetch_device_description_once(
         av_transport_url,
         status: crate::state::PlaybackStatus::Idle,
         current_media: None,
-        loop_playback: false,
+        loop_playback: DEFAULT_RENDERER_LOOP_PLAYBACK,
     })
 }
 
@@ -243,7 +261,7 @@ fn extract_xml_text<'a>(xml: &'a str, tag: &str) -> Option<String> {
 fn find_av_transport_url(xml: &str, location: &str) -> Option<String> {
     // First try to get URLBase if present
     let url_base = extract_xml_text(xml, "URLBase");
-    
+
     // Locate the AVTransport serviceType, then find the next controlURL
     let service_marker = "AVTransport";
     let service_pos = xml.find(service_marker)?;
@@ -256,10 +274,8 @@ fn find_av_transport_url(xml: &str, location: &str) -> Option<String> {
     let path = after[start..end].trim().to_string();
 
     // Build absolute URL
-    let base = url_base
-        .or_else(|| Some(base_url(location)))
-        .unwrap();
-    
+    let base = url_base.or_else(|| Some(base_url(location))).unwrap();
+
     if path.starts_with("http") {
         Some(path)
     } else if path.starts_with('/') {
@@ -301,7 +317,10 @@ pub async fn discover_renderers() -> Vec<RendererDevice> {
     let locations = match ssdp_search(Duration::from_secs(MX as u64 + 1)) {
         Ok(l) => l,
         Err(e) => {
-            error!("SSDP search failed: {}. Check firewall settings and network connectivity.", e);
+            error!(
+                "SSDP search failed: {}. Check firewall settings and network connectivity.",
+                e
+            );
             return vec![];
         }
     };
@@ -327,6 +346,7 @@ pub async fn discover_renderers() -> Vec<RendererDevice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::PlaybackStatus;
 
     #[test]
     fn test_parse_location() {
@@ -427,7 +447,10 @@ mod tests {
     #[test]
     fn test_extract_xml_text_with_namespace() {
         let xml = r#"<root xmlns:u="urn:schemas-upnp-org"><u:friendlyName>Bedroom TV</u:friendlyName></root>"#;
-        assert_eq!(extract_xml_text(xml, "friendlyName"), Some("Bedroom TV".to_string()));
+        assert_eq!(
+            extract_xml_text(xml, "friendlyName"),
+            Some("Bedroom TV".to_string())
+        );
     }
 
     #[test]
@@ -439,12 +462,18 @@ mod tests {
 
     #[test]
     fn test_base_url_no_path() {
-        assert_eq!(base_url("http://192.168.1.5:49152"), "http://192.168.1.5:49152");
+        assert_eq!(
+            base_url("http://192.168.1.5:49152"),
+            "http://192.168.1.5:49152"
+        );
     }
 
     #[test]
     fn test_base_url_with_root() {
-        assert_eq!(base_url("http://192.168.1.5:49152/"), "http://192.168.1.5:49152");
+        assert_eq!(
+            base_url("http://192.168.1.5:49152/"),
+            "http://192.168.1.5:49152"
+        );
     }
 
     #[test]
@@ -491,7 +520,10 @@ mod tests {
         let result = find_av_transport_url(xml, "http://192.168.1.5:49152/desc.xml");
         assert_eq!(
             result,
-            Some("http://192.168.1.123:49152/_urn:schemas-upnp-org:service:AVTransport_control".to_string())
+            Some(
+                "http://192.168.1.123:49152/_urn:schemas-upnp-org:service:AVTransport_control"
+                    .to_string()
+            )
         );
     }
 
@@ -505,8 +537,27 @@ mod tests {
         let result = find_av_transport_url(xml, "http://192.168.1.5:49152/desc.xml");
         assert_eq!(
             result,
-            Some("http://192.168.1.5:49152/_urn:schemas-upnp-org:service:AVTransport_control".to_string())
+            Some(
+                "http://192.168.1.5:49152/_urn:schemas-upnp-org:service:AVTransport_control"
+                    .to_string()
+            )
         );
+    }
+
+    #[test]
+    fn test_new_renderer_defaults_to_loop_playback() {
+        let device = RendererDevice {
+            uuid: "uuid-1".to_string(),
+            name: "Lobby".to_string(),
+            alias: None,
+            ip: "10.137.32.242".to_string(),
+            av_transport_url: "http://10.137.32.242/ctrl".to_string(),
+            status: PlaybackStatus::Idle,
+            current_media: None,
+            loop_playback: DEFAULT_RENDERER_LOOP_PLAYBACK,
+        };
+
+        assert!(device.loop_playback);
     }
 
     #[test]
@@ -522,6 +573,9 @@ mod tests {
     fn test_ssdp_constants() {
         assert_eq!(SSDP_ADDR, "239.255.255.250");
         assert_eq!(SSDP_PORT, 1900);
-        assert_eq!(SEARCH_TARGETS[1], "urn:schemas-upnp-org:device:MediaRenderer:1");
+        assert_eq!(
+            SEARCH_TARGETS[1],
+            "urn:schemas-upnp-org:device:MediaRenderer:1"
+        );
     }
 }
