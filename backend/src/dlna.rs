@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::{debug, warn};
+use log::debug;
 use reqwest::Client;
 use std::time::Duration;
 
@@ -160,6 +160,12 @@ async fn set_play_mode_best_effort(
     }
 }
 
+/// Resume a renderer that unexpectedly stopped the current loop URI.
+pub async fn replay_media(client: &Client, av_transport_url: &str, media_uri: &str) -> Result<()> {
+    set_av_transport_uri(client, av_transport_url, media_uri).await?;
+    play(client, av_transport_url).await
+}
+
 /// Full play sequence: Stop → SetAVTransportURI → optional SetPlayMode → Play.
 pub async fn play_media(
     client: &Client,
@@ -178,14 +184,7 @@ pub async fn play_media(
     };
     set_av_transport_uri(client, av_transport_url, playback_uri).await?;
 
-    if loop_playback {
-        let native_loop = set_play_mode_best_effort(client, av_transport_url, "REPEAT_ONE").await;
-        if !native_loop && loop_media_uri.is_some() {
-            warn!(
-                "Renderer did not accept native loop playback; ScreenPilot is using ffmpeg loop stream"
-            );
-        }
-    } else {
+    if !loop_playback {
         let _ = set_play_mode_best_effort(client, av_transport_url, "NORMAL").await;
     }
 
