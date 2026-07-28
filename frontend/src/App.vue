@@ -24,6 +24,7 @@ const loginPassword = ref('')
 const loginLoading = ref(false)
 
 let refreshTimer: ReturnType<typeof setInterval> | null = null
+let deviceRefreshInFlight = false
 
 function checkMobile() {
   isMobile.value = window.innerWidth < 768
@@ -51,6 +52,21 @@ async function loadAppData() {
     store.loadDevices(),
     store.loadScenes(),
   ])
+}
+
+async function refreshDeviceSnapshot() {
+  if (document.visibilityState !== 'visible' || deviceRefreshInFlight || !store.isAuthenticated) {
+    return
+  }
+
+  deviceRefreshInFlight = true
+  try {
+    await store.loadDevices()
+  } catch {
+    // The next interval retries without interrupting the current view.
+  } finally {
+    deviceRefreshInFlight = false
+  }
 }
 
 async function handleLogin() {
@@ -96,14 +112,14 @@ onMounted(async () => {
   }
 
   refreshTimer = setInterval(() => {
-    if (store.isAuthenticated) {
-      store.loadDevices()
-    }
-  }, 30_000)
+    void refreshDeviceSnapshot()
+  }, 1_000)
+  document.addEventListener('visibilitychange', refreshDeviceSnapshot)
 })
 
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
+  document.removeEventListener('visibilitychange', refreshDeviceSnapshot)
   window.removeEventListener('resize', checkMobile)
 })
 

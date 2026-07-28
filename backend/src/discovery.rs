@@ -314,13 +314,19 @@ fn url_host(url: &str) -> Option<String> {
 /// Discover all DLNA MediaRenderer devices on the LAN.
 /// Returns a deduplicated list of `RendererDevice`.
 pub async fn discover_renderers() -> Vec<RendererDevice> {
-    let locations = match ssdp_search(Duration::from_secs(MX as u64 + 1)) {
-        Ok(l) => l,
-        Err(e) => {
+    let search =
+        tokio::task::spawn_blocking(|| ssdp_search(Duration::from_secs(MX as u64 + 1))).await;
+    let locations = match search {
+        Ok(Ok(locations)) => locations,
+        Ok(Err(e)) => {
             error!(
                 "SSDP search failed: {}. Check firewall settings and network connectivity.",
                 e
             );
+            return vec![];
+        }
+        Err(e) => {
+            error!("SSDP search task failed: {}", e);
             return vec![];
         }
     };

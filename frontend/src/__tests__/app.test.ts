@@ -42,6 +42,7 @@ describe('App shell', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     vi.clearAllMocks()
   })
 
@@ -71,6 +72,29 @@ describe('App shell', () => {
     expect(store.loadMediaFiles).toHaveBeenCalledTimes(1)
     expect(store.loadDevices).toHaveBeenCalledTimes(1)
     expect(store.loadScenes).toHaveBeenCalledTimes(1)
+
+    wrapper.unmount()
+  })
+
+  it('refreshes the in-memory device snapshot every second', async () => {
+    vi.useFakeTimers()
+    const wrapper = shallowMount(App, {
+      global: {
+        mocks: {
+          $route: { path: '/devices' },
+        },
+        stubs: {
+          RouterLink: RouterLinkStub,
+          RouterView: { template: '<div class="router-view-stub" />' },
+        },
+      },
+    })
+
+    await flushPromises()
+    expect(store.loadDevices).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(store.loadDevices).toHaveBeenCalledTimes(2)
 
     wrapper.unmount()
   })

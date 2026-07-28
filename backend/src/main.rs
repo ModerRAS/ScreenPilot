@@ -26,6 +26,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -107,7 +108,7 @@ async fn serve_favicon() -> impl axum::response::IntoResponse {
 #[derive(Clone)]
 pub struct WebAppState {
     pub shared: SharedState,
-    pub client: Arc<Mutex<Client>>,
+    pub client: Client,
     pub media_dir: PathBuf,
     pub cached_encoders: Arc<Mutex<Option<DetectionResult>>>,
     pub auth: Arc<AuthState>,
@@ -295,9 +296,11 @@ const MAX_DEVICE_ALIAS_CHARS: usize = 64;
 const MAX_SCENE_NAME_CHARS: usize = 80;
 const SCENE_APPLY_LOOP_PLAYBACK: bool = true;
 const PLAYBACK_START_PROBE_DELAY: Duration = Duration::from_secs(2);
+const PLAYBACK_START_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PLAYBACK_START_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const PLAYBACK_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const PLAYBACK_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
+const DEVICE_REQUEST_CONCURRENCY: usize = 8;
 const LOOP_RESTART_TIMEOUT: Duration = Duration::from_millis(550);
 #[cfg(test)]
 const LOOP_RECOVERY_DEADLINE: Duration = Duration::from_secs(1);
@@ -578,7 +581,6 @@ async fn auth_status(
 
 /// GET /api/devices — return the current device list without triggering a new scan.
 async fn get_devices(State(app): State<WebAppState>) -> Json<Vec<RendererDevice>> {
-    refresh_playback_statuses(&app).await;
     let st = app.shared.read().await;
     Json(st.devices.clone())
 }
@@ -796,8 +798,7 @@ async fn pause_device(
     let av_url = resolve_av_url(&app, &device_uuid)
         .await
         .map_err(|e| error_response(StatusCode::NOT_FOUND, e))?;
-    let client = app.client.lock().await;
-    dlna::pause(&client, &av_url)
+    dlna::pause(&app.client, &av_url)
         .await
         .map_err(|e| error_response(StatusCode::BAD_GATEWAY, e.to_string()))?;
 
@@ -816,8 +817,7 @@ async fn stop_device(
     let av_url = resolve_av_url(&app, &device_uuid)
         .await
         .map_err(|e| error_response(StatusCode::NOT_FOUND, e))?;
-    let client = app.client.lock().await;
-    dlna::stop(&client, &av_url)
+    dlna::stop(&app.client, &av_url)
         .await
         .map_err(|e| error_response(StatusCode::BAD_GATEWAY, e.to_string()))?;
 
@@ -1032,10 +1032,7 @@ async fn restart_looping_playback(
         (target, st.media_server_base_url.clone())
     };
     let loop_media_uri = media_loop_stream_url(&media_base, filename);
-    let client = {
-        let client = app.client.lock().await;
-        client.clone()
-    };
+    let client = app.client.clone();
 
     log::warn!(
         "Renderer {} at {} stopped while loop playback is enabled; replaying {}",
@@ -1087,170 +1084,180 @@ async fn restart_looping_playback(
     Ok(())
 }
 
+async fn refresh_playback_snapshot(
+    app: &WebAppState,
+    client: &Client,
+    media_base: &str,
+    snapshot: PlaybackSnapshot,
+) {
+    let result = tokio::time::timeout(
+        PLAYBACK_STATUS_REQUEST_TIMEOUT,
+        dlna::get_transport_info(client, &snapshot.av_transport_url),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(info)) => {
+            let actual_status = playback_status_from_transport_state(&info.current_transport_state);
+            let has_active_stream = has_active_loop_stream(app, &snapshot.ip);
+            let has_playback_window = has_active_playback_window(app, &snapshot.ip);
+
+            if snapshot.loop_playback && is_terminal_playback_status(&actual_status) {
+                if let Some(filename) = snapshot.current_media.as_deref() {
+                    if let Err(e) = restart_looping_playback(app, &snapshot, filename).await {
+                        log::warn!(
+                            "Failed to restart loop playback on {}: {}",
+                            snapshot.uuid,
+                            e
+                        );
+                        mark_device_status_error(app, &snapshot.uuid).await;
+                    }
+                    return;
+                }
+            }
+
+            let actual_media = if snapshot.current_media.is_some() {
+                snapshot.current_media.clone()
+            } else {
+                let media_result = tokio::time::timeout(
+                    PLAYBACK_STATUS_REQUEST_TIMEOUT,
+                    dlna::get_media_info(client, &snapshot.av_transport_url),
+                )
+                .await;
+                match media_result {
+                    Ok(Ok(media_info)) => {
+                        current_media_from_screenpilot_uri(media_base, &media_info.current_uri)
+                    }
+                    Ok(Err(e)) => {
+                        log::debug!("Failed to refresh media URI for {}: {}", snapshot.uuid, e);
+                        None
+                    }
+                    Err(_) => {
+                        log::debug!("Timed out refreshing media URI for {}", snapshot.uuid);
+                        None
+                    }
+                }
+            };
+
+            if snapshot.loop_playback
+                && is_transitioning_transport_state(&info.current_transport_state)
+                && !(has_active_stream || has_playback_window)
+            {
+                if let Some(filename) = actual_media
+                    .as_deref()
+                    .or(snapshot.current_media.as_deref())
+                {
+                    if let Err(e) = restart_looping_playback(app, &snapshot, filename).await {
+                        log::warn!(
+                            "Failed to restart loop playback on {}: {}",
+                            snapshot.uuid,
+                            e
+                        );
+                        mark_device_status_error(app, &snapshot.uuid).await;
+                    }
+                    return;
+                }
+            }
+
+            if is_terminal_playback_status(&actual_status) && snapshot.loop_playback {
+                if let Some(filename) = actual_media
+                    .as_deref()
+                    .or(snapshot.current_media.as_deref())
+                {
+                    if let Err(e) = restart_looping_playback(app, &snapshot, filename).await {
+                        log::warn!(
+                            "Failed to restart loop playback on {}: {}",
+                            snapshot.uuid,
+                            e
+                        );
+                        mark_device_status_error(app, &snapshot.uuid).await;
+                    }
+                    return;
+                }
+            }
+
+            set_device_status_and_media(app, &snapshot.uuid, actual_status, actual_media).await;
+        }
+        Ok(Err(e)) => {
+            log::debug!(
+                "Failed to refresh playback status for {}: {}",
+                snapshot.uuid,
+                e
+            );
+            if snapshot.loop_playback
+                && (has_active_loop_stream(app, &snapshot.ip)
+                    || has_active_playback_window(app, &snapshot.ip))
+            {
+                set_device_status_and_media(
+                    app,
+                    &snapshot.uuid,
+                    PlaybackStatus::Playing,
+                    snapshot.current_media.clone(),
+                )
+                .await;
+                return;
+            }
+            if matches!(
+                snapshot.status,
+                PlaybackStatus::Playing | PlaybackStatus::Paused
+            ) {
+                mark_device_status_error(app, &snapshot.uuid).await;
+            } else if snapshot.current_media.is_some()
+                && is_terminal_playback_status(&snapshot.status)
+            {
+                clear_device_current_media(app, &snapshot.uuid).await;
+            }
+        }
+        Err(_) => {
+            log::debug!("Timed out refreshing playback status for {}", snapshot.uuid);
+            if snapshot.loop_playback
+                && (has_active_loop_stream(app, &snapshot.ip)
+                    || has_active_playback_window(app, &snapshot.ip))
+            {
+                set_device_status_and_media(
+                    app,
+                    &snapshot.uuid,
+                    PlaybackStatus::Playing,
+                    snapshot.current_media.clone(),
+                )
+                .await;
+                return;
+            }
+            if matches!(
+                snapshot.status,
+                PlaybackStatus::Playing | PlaybackStatus::Paused
+            ) {
+                mark_device_status_error(app, &snapshot.uuid).await;
+            } else if snapshot.current_media.is_some()
+                && is_terminal_playback_status(&snapshot.status)
+            {
+                clear_device_current_media(app, &snapshot.uuid).await;
+            }
+        }
+    }
+}
+
 async fn refresh_playback_statuses(app: &WebAppState) {
     let snapshots = playback_snapshots(app).await;
     if snapshots.is_empty() {
         return;
     }
 
-    let client = {
-        let client = app.client.lock().await;
-        client.clone()
-    };
-
+    let client = app.client.clone();
     let media_base = {
         let st = app.shared.read().await;
         st.media_server_base_url.clone()
     };
 
-    for snapshot in snapshots {
-        let result = tokio::time::timeout(
-            PLAYBACK_STATUS_REQUEST_TIMEOUT,
-            dlna::get_transport_info(&client, &snapshot.av_transport_url),
-        )
+    stream::iter(snapshots)
+        .for_each_concurrent(Some(DEVICE_REQUEST_CONCURRENCY), |snapshot| {
+            let client = client.clone();
+            let media_base = media_base.clone();
+            async move {
+                refresh_playback_snapshot(app, &client, &media_base, snapshot).await;
+            }
+        })
         .await;
-
-        match result {
-            Ok(Ok(info)) => {
-                let actual_status =
-                    playback_status_from_transport_state(&info.current_transport_state);
-                let has_active_stream = has_active_loop_stream(app, &snapshot.ip);
-                let has_playback_window = has_active_playback_window(app, &snapshot.ip);
-
-                if snapshot.loop_playback && is_terminal_playback_status(&actual_status) {
-                    if let Some(filename) = snapshot.current_media.as_deref() {
-                        if let Err(e) = restart_looping_playback(app, &snapshot, filename).await {
-                            log::warn!(
-                                "Failed to restart loop playback on {}: {}",
-                                snapshot.uuid,
-                                e
-                            );
-                            mark_device_status_error(app, &snapshot.uuid).await;
-                        }
-                        continue;
-                    }
-                }
-
-                let actual_media = if snapshot.current_media.is_some() {
-                    snapshot.current_media.clone()
-                } else {
-                    let media_result = tokio::time::timeout(
-                        PLAYBACK_STATUS_REQUEST_TIMEOUT,
-                        dlna::get_media_info(&client, &snapshot.av_transport_url),
-                    )
-                    .await;
-                    match media_result {
-                        Ok(Ok(media_info)) => {
-                            current_media_from_screenpilot_uri(&media_base, &media_info.current_uri)
-                        }
-                        Ok(Err(e)) => {
-                            log::debug!("Failed to refresh media URI for {}: {}", snapshot.uuid, e);
-                            None
-                        }
-                        Err(_) => {
-                            log::debug!("Timed out refreshing media URI for {}", snapshot.uuid);
-                            None
-                        }
-                    }
-                };
-
-                if snapshot.loop_playback
-                    && is_transitioning_transport_state(&info.current_transport_state)
-                    && !(has_active_stream || has_playback_window)
-                {
-                    if let Some(filename) = actual_media
-                        .as_deref()
-                        .or(snapshot.current_media.as_deref())
-                    {
-                        if let Err(e) = restart_looping_playback(app, &snapshot, filename).await {
-                            log::warn!(
-                                "Failed to restart loop playback on {}: {}",
-                                snapshot.uuid,
-                                e
-                            );
-                            mark_device_status_error(app, &snapshot.uuid).await;
-                        }
-                        continue;
-                    }
-                }
-
-                if is_terminal_playback_status(&actual_status) && snapshot.loop_playback {
-                    if let Some(filename) = actual_media
-                        .as_deref()
-                        .or(snapshot.current_media.as_deref())
-                    {
-                        if let Err(e) = restart_looping_playback(app, &snapshot, filename).await {
-                            log::warn!(
-                                "Failed to restart loop playback on {}: {}",
-                                snapshot.uuid,
-                                e
-                            );
-                            mark_device_status_error(app, &snapshot.uuid).await;
-                        }
-                        continue;
-                    }
-                }
-
-                set_device_status_and_media(app, &snapshot.uuid, actual_status, actual_media).await;
-            }
-            Ok(Err(e)) => {
-                log::debug!(
-                    "Failed to refresh playback status for {}: {}",
-                    snapshot.uuid,
-                    e
-                );
-                if snapshot.loop_playback
-                    && (has_active_loop_stream(app, &snapshot.ip)
-                        || has_active_playback_window(app, &snapshot.ip))
-                {
-                    set_device_status_and_media(
-                        app,
-                        &snapshot.uuid,
-                        PlaybackStatus::Playing,
-                        snapshot.current_media.clone(),
-                    )
-                    .await;
-                    continue;
-                }
-                if matches!(
-                    snapshot.status,
-                    PlaybackStatus::Playing | PlaybackStatus::Paused
-                ) {
-                    mark_device_status_error(app, &snapshot.uuid).await;
-                } else if snapshot.current_media.is_some()
-                    && is_terminal_playback_status(&snapshot.status)
-                {
-                    clear_device_current_media(app, &snapshot.uuid).await;
-                }
-            }
-            Err(_) => {
-                log::debug!("Timed out refreshing playback status for {}", snapshot.uuid);
-                if snapshot.loop_playback
-                    && (has_active_loop_stream(app, &snapshot.ip)
-                        || has_active_playback_window(app, &snapshot.ip))
-                {
-                    set_device_status_and_media(
-                        app,
-                        &snapshot.uuid,
-                        PlaybackStatus::Playing,
-                        snapshot.current_media.clone(),
-                    )
-                    .await;
-                    continue;
-                }
-                if matches!(
-                    snapshot.status,
-                    PlaybackStatus::Playing | PlaybackStatus::Paused
-                ) {
-                    mark_device_status_error(app, &snapshot.uuid).await;
-                } else if snapshot.current_media.is_some()
-                    && is_terminal_playback_status(&snapshot.status)
-                {
-                    clear_device_current_media(app, &snapshot.uuid).await;
-                }
-            }
-        }
-    }
 }
 
 async fn run_playback_status_worker(app: WebAppState) {
@@ -2005,7 +2012,17 @@ async fn prepare_media_for_dlna(
         return Ok(PreparedMedia::Transcoded(cache_path));
     }
 
-    if let Some(info) = probe_media_info(&media_path) {
+    let media_info = {
+        let media_path = media_path.clone();
+        tokio::task::spawn_blocking(move || probe_media_info(&media_path))
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("Media probe task failed for {}: {}", filename, e);
+                None
+            })
+    };
+
+    if let Some(info) = media_info {
         if is_dlna_bypass_compatible(&info, filename) {
             log::debug!("Bypassing transcode for DLNA-safe media: {}", filename);
             return Ok(PreparedMedia::Original(media_path));
@@ -2119,13 +2136,23 @@ async fn probe_playback_started(
     av_url: &str,
     device_ip: &str,
 ) -> PlaybackStartProbe {
-    tokio::time::sleep(PLAYBACK_START_PROBE_DELAY).await;
+    let deadline = Instant::now() + PLAYBACK_START_PROBE_DELAY;
+    loop {
+        if has_active_loop_stream(app, device_ip) {
+            return PlaybackStartProbe::Confirmed;
+        }
+        if has_active_playback_window(app, device_ip) {
+            return PlaybackStartProbe::Confirmed;
+        }
 
-    if has_active_loop_stream(app, device_ip) {
-        return PlaybackStartProbe::Confirmed;
-    }
-    if has_active_playback_window(app, device_ip) {
-        return PlaybackStartProbe::Confirmed;
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(
+            PLAYBACK_START_ACTIVITY_POLL_INTERVAL.min(deadline.saturating_duration_since(now)),
+        )
+        .await;
     }
 
     let result = tokio::time::timeout(
@@ -2166,10 +2193,7 @@ async fn start_device_playback(
         .map_err(|(_, Json(err))| err.error)?;
     let loop_media_uri = media_loop_stream_url(media_base, filename);
 
-    let client = {
-        let client = app.client.lock().await;
-        client.clone()
-    };
+    let client = app.client.clone();
     dlna::play_media(
         &client,
         av_url,
@@ -2238,10 +2262,7 @@ async fn start_device_playback_with_fallback(
                     av_url,
                     reason
                 );
-                let _ = {
-                    let client = app.client.lock().await;
-                    dlna::stop(&client, av_url).await
-                };
+                let _ = dlna::stop(&app.client, av_url).await;
                 last_error = Some(reason);
             }
             Err(e) => {
@@ -2508,11 +2529,17 @@ async fn stream_media(
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    let playback_path = prepared.path().clone();
+    let playback_window =
+        tokio::task::spawn_blocking(move || playback_window_for_media_path(&playback_path))
+            .await
+            .unwrap_or(PLAYBACK_WINDOW_FALLBACK + PLAYBACK_WINDOW_GRACE);
+
     let activity = LoopStreamActivity {
         ip: addr.ip().to_string(),
         active_loop_streams: Arc::clone(&app.active_loop_streams),
         playback_windows: Arc::clone(&app.playback_windows),
-        playback_window: Some(playback_window_for_media_path(prepared.path())),
+        playback_window: Some(playback_window),
     };
     mark_loop_stream_active(&app, &activity.ip);
 
@@ -2854,6 +2881,66 @@ async fn delete_scene(
     Ok(StatusCode::OK)
 }
 
+async fn apply_scene_assignment(
+    app: &WebAppState,
+    media_base: &str,
+    uuid: String,
+    filename: String,
+) -> SceneApplyResult {
+    let target = {
+        let st = app.shared.read().await;
+        playback_targets_for_device(&st.devices, &uuid)
+    };
+    let Some(target) = target else {
+        return SceneApplyResult {
+            device_uuid: uuid.clone(),
+            success: false,
+            error: Some(format!("Device not found: {}", uuid)),
+        };
+    };
+    if target.av_transport_urls.is_empty() {
+        return SceneApplyResult {
+            device_uuid: uuid.clone(),
+            success: false,
+            error: Some(format!("Device AVTransport URL is empty: {}", uuid)),
+        };
+    }
+
+    match start_device_playback_with_fallback(
+        app,
+        &target,
+        media_base,
+        &filename,
+        SCENE_APPLY_LOOP_PLAYBACK,
+    )
+    .await
+    {
+        Ok(used_av_url) => {
+            let mut st = app.shared.write().await;
+            if let Some(device) = st.devices.iter_mut().find(|device| device.uuid == uuid) {
+                device.av_transport_url = used_av_url.clone();
+            }
+            set_playing_for_matching_renderers(
+                &mut st.devices,
+                &uuid,
+                &used_av_url,
+                &filename,
+                SCENE_APPLY_LOOP_PLAYBACK,
+            );
+            SceneApplyResult {
+                device_uuid: uuid,
+                success: true,
+                error: None,
+            }
+        }
+        Err(e) => SceneApplyResult {
+            device_uuid: uuid,
+            success: false,
+            error: Some(e.to_string()),
+        },
+    }
+}
+
 /// POST /api/scenes/:name/apply — apply a scene to all assigned devices.
 async fn apply_scene(
     State(app): State<WebAppState>,
@@ -2874,84 +2961,24 @@ async fn apply_scene(
         (scene.assignments.clone(), st.media_server_base_url.clone())
     };
 
-    let mut results = Vec::new();
-    for (uuid, filename) in &assignments {
-        let av_url = {
+    let results = stream::iter(assignments)
+        .map(|(uuid, filename)| {
+            let app = &app;
+            let media_base = media_base.clone();
+            async move { apply_scene_assignment(app, &media_base, uuid, filename).await }
+        })
+        .buffer_unordered(DEVICE_REQUEST_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    if results.iter().any(|result| result.success) {
+        let devices_to_save = {
             let st = app.shared.read().await;
-            match st.devices.iter().find(|d| d.uuid == *uuid) {
-                Some(device) => device.av_transport_url.clone(),
-                None => {
-                    results.push(SceneApplyResult {
-                        device_uuid: uuid.clone(),
-                        success: false,
-                        error: Some(format!("Device not found: {}", uuid)),
-                    });
-                    continue;
-                }
-            }
+            st.devices.clone()
         };
-        if av_url.is_empty() {
-            results.push(SceneApplyResult {
-                device_uuid: uuid.clone(),
-                success: false,
-                error: Some(format!("Device AVTransport URL is empty: {}", uuid)),
-            });
-            continue;
-        }
-        let target = {
-            let st = app.shared.read().await;
-            match playback_targets_for_device(&st.devices, uuid) {
-                Some(target) => target,
-                None => {
-                    results.push(SceneApplyResult {
-                        device_uuid: uuid.clone(),
-                        success: false,
-                        error: Some(format!("Device not found: {}", uuid)),
-                    });
-                    continue;
-                }
-            }
-        };
-        match start_device_playback_with_fallback(
-            &app,
-            &target,
-            &media_base,
-            filename,
-            SCENE_APPLY_LOOP_PLAYBACK,
-        )
-        .await
-        {
-            Ok(used_av_url) => {
-                let devices_to_save = {
-                    let mut st = app.shared.write().await;
-                    if let Some(d) = st.devices.iter_mut().find(|d| d.uuid == *uuid) {
-                        d.av_transport_url = used_av_url.clone();
-                    }
-                    set_playing_for_matching_renderers(
-                        &mut st.devices,
-                        uuid,
-                        &used_av_url,
-                        filename,
-                        SCENE_APPLY_LOOP_PLAYBACK,
-                    );
-                    st.devices.clone()
-                };
-                persist_devices_best_effort(&devices_to_save, "scene playback").await;
-                results.push(SceneApplyResult {
-                    device_uuid: uuid.clone(),
-                    success: true,
-                    error: None,
-                });
-            }
-            Err(e) => {
-                results.push(SceneApplyResult {
-                    device_uuid: uuid.clone(),
-                    success: false,
-                    error: Some(e.to_string()),
-                });
-            }
-        }
+        persist_devices_best_effort(&devices_to_save, "scene playback").await;
     }
+
     Ok(Json(results))
 }
 
@@ -3161,7 +3188,7 @@ async fn main() {
 
     let app_state = WebAppState {
         shared,
-        client: Arc::new(Mutex::new(Client::new())),
+        client: Client::new(),
         media_dir: media_dir.clone(),
         cached_encoders: Arc::new(Mutex::new(None)),
         auth: Arc::new(AuthState::from_config(loaded_config.config.auth)),
@@ -3269,7 +3296,7 @@ async fn bind_with_fallback(port: u16) -> (tokio::net::TcpListener, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct MockRendererState {
@@ -3319,6 +3346,55 @@ mod tests {
             .into_response()
     }
 
+    #[derive(Clone)]
+    struct ConcurrentRendererState {
+        transport_requests: Arc<AtomicUsize>,
+        play_times: Arc<StdMutex<Vec<Instant>>>,
+    }
+
+    async fn concurrent_mock_av_transport(
+        State(state): State<ConcurrentRendererState>,
+        Path(mode): Path<String>,
+        headers: HeaderMap,
+    ) -> Response {
+        let action = headers
+            .get("soapaction")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        let body = if action.contains("GetTransportInfo") {
+            state.transport_requests.fetch_add(1, Ordering::SeqCst);
+            if mode.starts_with("slow") {
+                tokio::time::sleep(PLAYBACK_STATUS_REQUEST_TIMEOUT * 2).await;
+            }
+            let transport_state = if mode == "stopped" {
+                "STOPPED"
+            } else {
+                "PLAYING"
+            };
+            format!(
+                "<CurrentTransportState>{transport_state}</CurrentTransportState>\
+                 <CurrentTransportStatus>OK</CurrentTransportStatus>\
+                 <CurrentSpeed>1</CurrentSpeed>"
+            )
+        } else {
+            if action.contains("Play") {
+                state
+                    .play_times
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(Instant::now());
+            }
+            "<Result>OK</Result>".to_string()
+        };
+
+        (
+            [(header::CONTENT_TYPE, HeaderValue::from_static("text/xml"))],
+            body,
+        )
+            .into_response()
+    }
+
     fn mock_web_app_state(av_transport_url: String, media_dir: PathBuf) -> WebAppState {
         let shared = state::new_shared_state();
         {
@@ -3342,7 +3418,7 @@ mod tests {
 
         WebAppState {
             shared,
-            client: Arc::new(Mutex::new(Client::new())),
+            client: Client::new(),
             media_dir,
             cached_encoders: Arc::new(Mutex::new(None)),
             auth: Arc::new(AuthState::from_config(config::AuthSettings {
@@ -3413,6 +3489,76 @@ mod tests {
         }
 
         worker.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_device_snapshot_is_local_and_status_refresh_is_concurrent() {
+        let renderer = ConcurrentRendererState {
+            transport_requests: Arc::new(AtomicUsize::new(0)),
+            play_times: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/avtransport/:mode", post(concurrent_mock_av_transport))
+            .with_state(renderer.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let media_dir = tempfile::tempdir().unwrap();
+        let app = mock_web_app_state(
+            format!("http://{address}/avtransport/stopped"),
+            media_dir.path().to_path_buf(),
+        );
+        {
+            let mut state = app.shared.write().await;
+            let stopped_renderer = state.devices.pop().unwrap();
+            for index in 0..5 {
+                state.devices.push(RendererDevice {
+                    uuid: format!("slow-renderer-{index}"),
+                    name: format!("Slow renderer {index}"),
+                    alias: None,
+                    ip: format!("127.0.0.{}", index + 2),
+                    av_transport_url: format!("http://{address}/avtransport/slow-{index}"),
+                    status: PlaybackStatus::Playing,
+                    current_media: Some("promo.mp4".to_string()),
+                    loop_playback: true,
+                });
+            }
+            state.devices.push(stopped_renderer);
+        }
+
+        let Json(devices) = get_devices(State(app.clone())).await;
+        assert_eq!(devices.len(), 6);
+        assert_eq!(renderer.transport_requests.load(Ordering::SeqCst), 0);
+
+        let probe_started = Instant::now();
+        let probe = probe_playback_started(
+            &app,
+            &app.client,
+            "http://unused.invalid/avtransport",
+            "127.0.0.1",
+        )
+        .await;
+        assert_eq!(probe, PlaybackStartProbe::Confirmed);
+        assert!(probe_started.elapsed() < Duration::from_millis(250));
+
+        let refresh_started = Instant::now();
+        refresh_playback_statuses(&app).await;
+        let replayed_at = renderer
+            .play_times
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .first()
+            .copied()
+            .expect("stopped renderer was not replayed");
+        assert!(
+            replayed_at.duration_since(refresh_started) < LOOP_RECOVERY_DEADLINE,
+            "slow renderers blocked loop recovery past one second"
+        );
+
         server.abort();
     }
 
